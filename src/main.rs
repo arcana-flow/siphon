@@ -24,6 +24,7 @@ fn main() -> ExitCode {
     match execute(cli, &services) {
         Ok(output) => {
             print!("{}", output.stdout);
+            eprint!("{}", output.stderr);
             ExitCode::SUCCESS
         }
         Err(err) => {

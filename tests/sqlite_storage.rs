@@ -1020,8 +1020,10 @@ fn app_services_work_end_to_end_with_sqlite_storage_across_reopen() {
         let pending_out = run_cli(&services, &["siphon", "upload", "list"]).unwrap();
         assert!(pending_out.contains("Video by Creator 9001"));
 
-        let dl_out = run_cli(&services, &["siphon", "download", "--upload", "1"]).unwrap();
-        assert!(dl_out.contains("marked as downloaded"));
+        let dl_cli = Cli::try_parse_from(["siphon", "download", "--upload", "1"]).unwrap();
+        let dl_out = execute(dl_cli, &services).unwrap();
+        assert!(dl_out.stdout.is_empty());
+        assert!(dl_out.stderr.contains("marked as downloaded"));
 
         let reqs = downloader.requests.lock().unwrap();
         assert_eq!(reqs.len(), 1);

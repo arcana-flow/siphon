@@ -243,6 +243,13 @@ pub enum DownloadError {
         reason: String,
     },
 
+    /// Supplied download arguments violate single-target or safety constraints.
+    #[error("invalid download arguments: {reason}")]
+    InvalidArguments {
+        /// Explanation of why the arguments were rejected.
+        reason: String,
+    },
+
     /// Unexpected I/O error while preparing or inspecting download artifacts.
     #[error("download I/O error: {0}")]
     Io(String),

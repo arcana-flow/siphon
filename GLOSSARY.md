@@ -24,3 +24,9 @@ A named set of arguments that can be reused across downloads.
 
 **Default preset**  
 The download preset used when the user does not specify one. It starts as the built-in preset and can be changed by the user.
+
+## Background jobs
+
+**Background job**
+
+A submitted download or refresh that can continue after the submitting command returns. Its job ID identifies that execution when querying its progress or outcome.

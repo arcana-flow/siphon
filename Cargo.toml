@@ -1,0 +1,10 @@
+[package]
+name = "siphon"
+version = "0.1.0"
+edition = "2024"
+description = "Rust CLI for following Bilibili creators, tracking uploads, and downloading media with yt-dlp"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive", "env"] }
+thiserror = "2.0"

@@ -725,13 +725,17 @@ impl SqliteStorage {
 
 fn configure_connection(conn: &Connection, enable_wal: bool) -> Result<(), StorageError> {
     conn.busy_timeout(BUSY_TIMEOUT).map_err(map_sqlite_err)?;
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(map_sqlite_err)?;
-    if enable_wal {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(map_sqlite_err)?;
-    }
-    Ok(())
+    migrations::retry_sqlite_on_busy(|| {
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        if enable_wal {
+            let current_mode: String =
+                conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+            if !current_mode.eq_ignore_ascii_case("wal") {
+                conn.pragma_update(None, "journal_mode", "WAL")?;
+            }
+        }
+        Ok(())
+    })
 }
 
 fn find_creator(conn: &Connection, creator_id: CreatorId) -> Result<Creator, StorageError> {

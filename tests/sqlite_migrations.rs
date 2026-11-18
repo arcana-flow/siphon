@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use rusqlite::Connection;
@@ -415,11 +416,14 @@ fn schema_constraints_and_autoincrement_follow_ids_are_enforced_at_sql_level() {
 fn concurrent_open_calls_on_new_database_succeed_cleanly() {
     let temp = TempDir::new("concurrent-open");
     let db_path = temp.path().join("concurrent.db");
+    let barrier = Arc::new(Barrier::new(8));
 
-    let handles: Vec<_> = (0..4)
+    let handles: Vec<_> = (0..8)
         .map(|_| {
             let path = db_path.clone();
+            let start = Arc::clone(&barrier);
             thread::spawn(move || {
+                start.wait();
                 let storage = SqliteStorage::open(&path).unwrap();
                 assert_eq!(storage.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
             })

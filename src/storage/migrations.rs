@@ -1,9 +1,13 @@
 //! Versioned SQLite schema migrations for Siphon.
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::time::{Duration, Instant};
+
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 
 use crate::domain::Timestamp;
 use crate::error::StorageError;
+
+pub(crate) const BUSY_RETRY_WINDOW: Duration = Duration::from_secs(5);
 
 /// Definition of a single forward-only SQLite schema migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,9 +124,17 @@ pub fn apply_migrations(
 ) -> Result<(), StorageError> {
     validate_migration_definitions(migrations)?;
 
-    if schema_migrations_exists(conn)? {
-        let applied = read_applied_migrations(conn)?;
-        let pending_start = validate_applied(&applied, migrations)?;
+    retry_storage_on_busy(|| apply_migrations_once(conn, migrations))
+}
+
+fn apply_migrations_once(
+    conn: &mut Connection,
+    migrations: &[Migration],
+) -> Result<(), MigrationAttemptError> {
+    if schema_migrations_exists(conn).map_err(MigrationAttemptError::Sqlite)? {
+        let applied = read_applied_migrations(conn).map_err(MigrationAttemptError::Sqlite)?;
+        let pending_start =
+            validate_applied(&applied, migrations).map_err(MigrationAttemptError::Storage)?;
         if pending_start == migrations.len() {
             return Ok(());
         }
@@ -130,7 +142,7 @@ pub fn apply_migrations(
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(map_err)?;
+        .map_err(MigrationAttemptError::Sqlite)?;
 
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -139,30 +151,32 @@ pub fn apply_migrations(
             applied_at INTEGER NOT NULL
         );",
     )
-    .map_err(map_err)?;
+    .map_err(MigrationAttemptError::Sqlite)?;
 
-    let applied = read_applied_migrations(&tx)?;
-    let pending_start = validate_applied(&applied, migrations)?;
+    let applied = read_applied_migrations(&tx).map_err(MigrationAttemptError::Sqlite)?;
+    let pending_start =
+        validate_applied(&applied, migrations).map_err(MigrationAttemptError::Storage)?;
 
     let applied_at = Timestamp::now().as_unix_seconds();
     for migration in &migrations[pending_start..] {
-        tx.execute_batch(migration.sql).map_err(map_err)?;
+        tx.execute_batch(migration.sql)
+            .map_err(MigrationAttemptError::Sqlite)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![migration.version, migration.name, applied_at],
         )
-        .map_err(map_err)?;
+        .map_err(MigrationAttemptError::Sqlite)?;
     }
 
-    tx.commit().map_err(map_err)
+    tx.commit().map_err(MigrationAttemptError::Sqlite)
 }
 
 /// Returns all migrations currently recorded in `schema_migrations`, ordered by version.
 pub fn applied_migrations(conn: &Connection) -> Result<Vec<AppliedMigration>, StorageError> {
-    if !schema_migrations_exists(conn)? {
+    if !schema_migrations_exists(conn).map_err(map_err)? {
         return Ok(Vec::new());
     }
-    read_applied_migrations(conn)
+    read_applied_migrations(conn).map_err(map_err)
 }
 
 /// Returns the highest applied migration version, or `0` if uninitialized.
@@ -197,39 +211,79 @@ fn validate_migration_definitions(migrations: &[Migration]) -> Result<(), Storag
     Ok(())
 }
 
-fn schema_migrations_exists(conn: &Connection) -> Result<bool, StorageError> {
+fn schema_migrations_exists(conn: &Connection) -> Result<bool, rusqlite::Error> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
         [],
         |_| Ok(true),
     )
     .optional()
-    .map_err(map_err)
     .map(|opt| opt.unwrap_or(false))
 }
 
-fn read_applied_migrations(conn: &Connection) -> Result<Vec<AppliedMigration>, StorageError> {
+fn read_applied_migrations(conn: &Connection) -> Result<Vec<AppliedMigration>, rusqlite::Error> {
     let mut stmt = conn
-        .prepare("SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC")
-        .map_err(map_err)?;
-    let rows = stmt
-        .query_map([], |row| {
-            let version: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let applied_at: i64 = row.get(2)?;
-            Ok(AppliedMigration {
-                version,
-                name,
-                applied_at: Timestamp::from_unix_seconds(applied_at),
-            })
+        .prepare("SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC")?;
+    let rows = stmt.query_map([], |row| {
+        let version: i64 = row.get(0)?;
+        let name: String = row.get(1)?;
+        let applied_at: i64 = row.get(2)?;
+        Ok(AppliedMigration {
+            version,
+            name,
+            applied_at: Timestamp::from_unix_seconds(applied_at),
         })
-        .map_err(map_err)?;
+    })?;
 
     let mut applied = Vec::new();
     for row in rows {
-        applied.push(row.map_err(map_err)?);
+        applied.push(row?);
     }
     Ok(applied)
+}
+
+enum MigrationAttemptError {
+    Sqlite(rusqlite::Error),
+    Storage(StorageError),
+}
+
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(ffi_err, _)
+            if matches!(
+                ffi_err.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+pub(crate) fn retry_sqlite_on_busy<T, F>(mut op: F) -> Result<T, StorageError>
+where
+    F: FnMut() -> Result<T, rusqlite::Error>,
+{
+    retry_storage_on_busy(|| op().map_err(MigrationAttemptError::Sqlite))
+}
+
+fn retry_storage_on_busy<T, F>(mut op: F) -> Result<T, StorageError>
+where
+    F: FnMut() -> Result<T, MigrationAttemptError>,
+{
+    let deadline = Instant::now() + BUSY_RETRY_WINDOW;
+    let mut backoff = Duration::from_millis(5);
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(MigrationAttemptError::Sqlite(err))
+                if is_sqlite_busy(&err) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            Err(MigrationAttemptError::Sqlite(err)) => return Err(map_err(err)),
+            Err(MigrationAttemptError::Storage(err)) => return Err(err),
+        }
+    }
 }
 
 fn validate_applied(

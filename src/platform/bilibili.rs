@@ -150,9 +150,12 @@ impl BilibiliRefreshSource {
         if config.max_pages == 0 {
             config.max_pages = DEFAULT_MAX_PAGINATION_PAGES;
         }
+        // Disable HTTP redirects so Cookie headers and requests can never be redirected
+        // outside the configured API origin.
         let agent_config = ureq::Agent::config_builder()
             .timeout_global(Some(config.request_timeout))
             .http_status_as_error(false)
+            .max_redirects(0)
             .build();
         let agent = ureq::Agent::new_with_config(agent_config);
         Self {
@@ -273,6 +276,11 @@ impl BilibiliRefreshSource {
             .call()
             .map_err(|err| RefreshError::Network(err.to_string()))?;
         let status = response.status().as_u16();
+        if (300..400).contains(&status) {
+            return Err(RefreshError::PlatformResponse(format!(
+                "unexpected HTTP {status} redirect response from Bilibili API (redirects are disabled)"
+            )));
+        }
         let body = response
             .body_mut()
             .read_to_string()

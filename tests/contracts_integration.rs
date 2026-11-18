@@ -1149,8 +1149,10 @@ fn list_and_ignore_commands_render_human_readable_output() {
 }
 
 #[test]
-fn binary_reports_usage_and_unimplemented_backend_errors_cleanly() {
+fn binary_reports_usage_and_executes_against_temp_sqlite_cleanly() {
     let bin = env!("CARGO_BIN_EXE_siphon");
+    let temp = tempfile::TempDir::new().unwrap();
+    let db_path = temp.path().join("contract-check.db");
 
     let help = Command::new(bin).arg("--help").output().unwrap();
     assert!(help.status.success());
@@ -1164,12 +1166,28 @@ fn binary_reports_usage_and_unimplemented_backend_errors_cleanly() {
     let missing_args = Command::new(bin).output().unwrap();
     assert_eq!(missing_args.status.code(), Some(2));
 
-    let unimpl = Command::new(bin)
-        .args(["creator", "list"])
+    let list = Command::new(bin)
+        .args(["--db", &db_path.to_string_lossy(), "creator", "list"])
         .output()
         .unwrap();
-    assert_eq!(unimpl.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&unimpl.stderr);
+    assert!(list.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout),
+        "No followed creators.\n"
+    );
+
+    let missing_creator = Command::new(bin)
+        .args([
+            "--db",
+            &db_path.to_string_lossy(),
+            "creator",
+            "remove",
+            "999",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(missing_creator.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&missing_creator.stderr);
     assert!(stderr.contains("error:"));
-    assert!(stderr.contains("not implemented yet"));
+    assert!(stderr.contains("creator 999 not found"));
 }

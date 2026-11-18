@@ -453,6 +453,7 @@ struct RecordedHttpRequest {
 struct MockHttpResponse {
     status: u16,
     body: String,
+    location: Option<String>,
 }
 
 impl MockHttpResponse {
@@ -460,6 +461,7 @@ impl MockHttpResponse {
         Self {
             status: 200,
             body: body.into(),
+            location: None,
         }
     }
 
@@ -467,6 +469,15 @@ impl MockHttpResponse {
         Self {
             status,
             body: body.into(),
+            location: None,
+        }
+    }
+
+    fn redirect(status: u16, location: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: String::new(),
+            location: Some(location.into()),
         }
     }
 }
@@ -503,15 +514,23 @@ impl MockBilibiliServer {
                     let resp = router(&req);
                     let reason = match resp.status {
                         200 => "OK",
+                        302 => "Found",
+                        307 => "Temporary Redirect",
                         404 => "Not Found",
                         500 => "Internal Server Error",
                         502 => "Bad Gateway",
                         _ => "Status",
                     };
+                    let location_hdr = resp
+                        .location
+                        .as_deref()
+                        .map(|loc| format!("Location: {loc}\r\n"))
+                        .unwrap_or_default();
                     let raw = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                         resp.status,
                         reason,
+                        location_hdr,
                         resp.body.len(),
                         resp.body
                     );
@@ -1733,4 +1752,138 @@ fn code_zero_without_list_fails_as_malformed_response_and_preserves_checkpoint()
             initial_cp
         );
     }
+}
+
+#[test]
+fn cross_origin_redirects_are_rejected_without_leaking_cookies_or_headers() {
+    let nav_json = read_fixture("bilibili/nav_guest.json");
+    let acc_ok = read_fixture("bilibili/acc_info_946974.json");
+    let cookie_file = fixture_path("cookies/bilibili_netscape.txt");
+    let cookie_source = CookieSource::File(cookie_file);
+
+    let sink_server = MockBilibiliServer::start(|_req| MockHttpResponse::ok_json("{}"));
+    let redirect_target = format!(
+        "{}/steal?token=location-header-sentinel",
+        sink_server.base_url()
+    );
+    let redirect_target_clone = redirect_target.clone();
+
+    let mode = Arc::new(Mutex::new("arc_302"));
+    let mode_clone = Arc::clone(&mode);
+    let api_server = MockBilibiliServer::start(move |req| {
+        let current_mode = *mode_clone.lock().unwrap();
+        match (current_mode, req.path.as_str()) {
+            ("nav_302", "/x/web-interface/nav") => {
+                MockHttpResponse::redirect(302, &redirect_target_clone)
+            }
+            ("acc_307", "/x/web-interface/nav") => MockHttpResponse::ok_json(&nav_json),
+            ("acc_307", "/x/space/wbi/acc/info") => {
+                MockHttpResponse::redirect(307, &redirect_target_clone)
+            }
+            ("arc_302", "/x/web-interface/nav") => MockHttpResponse::ok_json(&nav_json),
+            ("arc_302", "/x/space/wbi/acc/info") => MockHttpResponse::ok_json(&acc_ok),
+            ("arc_302", "/x/space/wbi/arc/search") => {
+                MockHttpResponse::redirect(302, &redirect_target_clone)
+            }
+            ("spi_302", "/x/frontend/finger/spi") => {
+                MockHttpResponse::redirect(302, &redirect_target_clone)
+            }
+            ("spi_302", "/x/web-interface/nav") => MockHttpResponse::ok_json(&nav_json),
+            ("spi_302", "/x/space/wbi/acc/info") => MockHttpResponse::ok_json(&acc_ok),
+            _ => MockHttpResponse::status(404, "unexpected"),
+        }
+    });
+
+    let client = BilibiliRefreshSource::with_config(
+        BilibiliClientConfig::default()
+            .with_api_base_url(api_server.base_url())
+            .with_page_size(30)
+            .with_guest_buvid(true),
+    );
+
+    let assert_no_header_leaks = |msg: &str| {
+        for secret in [
+            "sanitized-sessdata-token",
+            "sanitized-bili-jct",
+            "SAN-BUVID3-0001",
+            "SESSDATA",
+            "location-header-sentinel",
+            sink_server.base_url().as_str(),
+        ] {
+            assert!(
+                !msg.contains(secret),
+                "error message unexpectedly exposed '{secret}': {msg}"
+            );
+        }
+    };
+
+    // 1. `/x/web-interface/nav` 302 redirect with cookies fails without hitting cross-origin sink.
+    *mode.lock().unwrap() = "nav_302";
+    let nav_err = client
+        .resolve_creator("https://space.bilibili.com/946974", Some(&cookie_source))
+        .unwrap_err();
+    assert!(matches!(nav_err, RefreshError::PlatformResponse(_)));
+    assert!(nav_err.to_string().contains("redirect"));
+    assert_no_header_leaks(&nav_err.to_string());
+
+    // 2. `/x/space/wbi/acc/info` 307 redirect with cookies fails without hitting cross-origin sink.
+    *mode.lock().unwrap() = "acc_307";
+    let acc_err = client
+        .resolve_creator("https://space.bilibili.com/946974", Some(&cookie_source))
+        .unwrap_err();
+    assert!(matches!(acc_err, RefreshError::PlatformResponse(_)));
+    assert!(acc_err.to_string().contains("307"));
+    assert_no_header_leaks(&acc_err.to_string());
+
+    // 3. `/x/space/wbi/arc/search` 302 redirect with cookies fails cleanly and preserves checkpoint.
+    *mode.lock().unwrap() = "arc_302";
+    let storage = TestStorage::new();
+    let initial_cp = Timestamp::from_unix_seconds(1_700_000_000);
+    let followed = storage.follow_at("946974", "Sanitized Creator Alpha", initial_cp);
+    let arc_err = refresh_creators(
+        &storage,
+        &client,
+        Some(followed.creator.id),
+        RefreshCookiePolicy::Explicit {
+            source: cookie_source,
+            save_as_default: false,
+        },
+    )
+    .unwrap()
+    .check_failures()
+    .unwrap_err();
+    assert!(matches!(
+        arc_err,
+        AppError::RefreshPartialFailure { succeeded: 0, .. }
+    ));
+    assert!(arc_err.to_string().contains("302"));
+    assert_no_header_leaks(&arc_err.to_string());
+    assert_eq!(
+        storage
+            .get_followed_creator(followed.creator.id)
+            .unwrap()
+            .follow
+            .refresh_checkpoint,
+        initial_cp
+    );
+
+    // 4. `/x/frontend/finger/spi` 302 redirect during guest lookup never follows cross-origin Location.
+    *mode.lock().unwrap() = "spi_302";
+    let resolved = client
+        .resolve_creator("https://space.bilibili.com/946974", None)
+        .unwrap();
+    assert_eq!(resolved.platform_creator_id, "946974");
+
+    // Verify cookies were sent to the configured API origin, and NEVER to the cross-origin sink.
+    assert!(api_server.requests().iter().any(|r| {
+        r.path == "/x/space/wbi/arc/search"
+            && r.cookie_header
+                .as_deref()
+                .is_some_and(|c| c.contains("SESSDATA=sanitized-sessdata-token"))
+    }));
+    assert!(
+        sink_server.requests().is_empty(),
+        "cross-origin redirect target unexpectedly received requests: {:?}",
+        sink_server.requests()
+    );
 }

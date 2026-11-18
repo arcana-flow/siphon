@@ -35,13 +35,15 @@ Siphon is a Rust CLI rewrite of `mrm`.
 | `siphon preset remove <NAME>` | Remove a download preset. |
 | `siphon preset set-default <NAME>` | Set the default download preset. |
 
-Use `--preset <NAME>` on either download command to select a preset for that invocation.
+Use `--preset <NAME>` on either download command to select a preset for that invocation, or `--db <PATH>` (or `SIPHON_DB`) on any command to override the default per-user SQLite database path (`$XDG_DATA_HOME/siphon/siphon.db` or `~/.local/share/siphon/siphon.db` on Linux, `~/Library/Application Support/siphon/siphon.db` on macOS, `%LOCALAPPDATA%\siphon\siphon.db` on Windows).
+
+`siphon download` routes Siphon status summaries to `stderr` so `yt-dlp` `stdout` (such as `-J` or `--print`) passes through uncontaminated.
 
 ## Cookies
 
-Both `refresh` and `download` accept cookies from a Netscape-format cookie file or a browser profile. Refresh uses the selected cookies for Bilibili requests. Download makes the selected cookies available to `yt-dlp`. See the [yt-dlp cookie options](https://github.com/yt-dlp/yt-dlp#filesystem-options).
+Both `refresh` and `download` accept `--cookies <FILE>` (a Netscape-format cookie file) or `--cookies-from-browser <BROWSER>` (`yt-dlp`-compatible browser profile selector). Refresh uses the selected cookies for Bilibili requests. Download makes the selected cookies available to `yt-dlp`. See the [yt-dlp cookie options](https://github.com/yt-dlp/yt-dlp#filesystem-options).
 
-Refresh can remember a default cookie source. Downloads use a cookie source only when explicitly selected for that invocation. The refresh default does not carry over to downloads.
+Refresh can remember a default cookie source with `--save-cookies`, clear it with `--clear-cookies`, or bypass it for one run with `--no-cookies`. Downloads use a cookie source only when explicitly selected for that invocation. The refresh default does not carry over to downloads.
 
 ## Continuous integration
 

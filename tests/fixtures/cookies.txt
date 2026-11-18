@@ -1,0 +1,4 @@
+# Netscape HTTP Cookie File
+# Synthetic offline test fixture (contains no real credentials)
+.bilibili.com	TRUE	/	FALSE	1893456000	SESSDATA	offline_test_session_cookie
+.bilibili.com	TRUE	/	FALSE	1893456000	bili_jct	offline_test_csrf_token

@@ -5,7 +5,7 @@ use clap::Parser;
 use clap::error::ErrorKind as ClapErrorKind;
 use serde::Serialize;
 use siphon::app::{AppExecuteOptions, AppServices, execute_with_options};
-use siphon::cli::{Cli, has_json_flag, resolve_help_command};
+use siphon::cli::{Cli, has_json_flag};
 use siphon::config::{RuntimeConfig, resolve_bilibili_api_base};
 use siphon::download::{DownloadExecutionOptions, YtDlpDownloader};
 use siphon::error::AppError;
@@ -27,8 +27,9 @@ fn main() -> ExitCode {
             }
             match clap_err.kind() {
                 ClapErrorKind::DisplayHelp => {
-                    let (path, cmd) = resolve_help_command(&raw_args);
-                    emit_json_response(&JsonResponse::ok(HelpData::from_clap_command(&path, &cmd)));
+                    emit_json_response(&JsonResponse::ok(HelpData::from_clap_help_error(
+                        &clap_err,
+                    )));
                     return ExitCode::SUCCESS;
                 }
                 ClapErrorKind::DisplayVersion => {

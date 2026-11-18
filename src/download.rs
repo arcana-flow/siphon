@@ -295,20 +295,21 @@ pub trait Downloader: Send + Sync {
 
     /// Executes the download using the requested [`DownloadExecutionOptions`].
     ///
-    /// Default implementation delegates to [`Downloader::download`] so existing test/stub
-    /// implementors continue to work unchanged.
+    /// Default implementation performs preflight validation and delegates to [`Downloader::download`]
+    /// so existing test/stub implementors continue to work unchanged.
     fn download_with_options(
         &self,
         request: &DownloadRequest,
         options: DownloadExecutionOptions,
     ) -> Result<DownloadOutcome, DownloadError> {
-        let _ = options;
+        request.validate()?;
+        if options.refuse_media_to_stdout {
+            let working_dir = env::current_dir().map_err(|err| {
+                DownloadError::Io(format!("failed to determine working dir: {err}"))
+            })?;
+            ensure_no_media_to_stdout(request, &working_dir)?;
+        }
         self.download(request)
-    }
-
-    /// Optional working directory hint used by pre-spawn effective option checks.
-    fn working_dir_hint(&self) -> Option<&Path> {
-        None
     }
 }
 
@@ -657,10 +658,6 @@ impl Downloader for YtDlpDownloader {
             confirmed_artifacts,
         })
     }
-
-    fn working_dir_hint(&self) -> Option<&Path> {
-        self.working_dir.as_deref()
-    }
 }
 
 /// Complete report returned by [`execute_download`].
@@ -734,17 +731,6 @@ pub fn execute_download_with_options(
         extra_args: input.extra_args,
         cookies: input.cookies,
     };
-
-    request.validate()?;
-    if options.refuse_media_to_stdout {
-        let working_dir = match downloader.working_dir_hint() {
-            Some(dir) => dir.to_path_buf(),
-            None => env::current_dir().map_err(|err| {
-                DownloadError::Io(format!("failed to determine working dir: {err}"))
-            })?,
-        };
-        ensure_no_media_to_stdout(&request, &working_dir)?;
-    }
 
     let outcome = downloader.download_with_options(&request, options)?;
     let marked_downloaded = match &request.target {
@@ -1366,8 +1352,22 @@ fn stream_and_capture_stderr<R: Read>(mut reader: R, forward_to_stderr: bool) ->
     String::from_utf8_lossy(&captured).into_owned()
 }
 
-/// Rejects invocations whose effective `yt-dlp` output template would stream media to stdout (`-o -`),
-/// taking active presets, extra arguments, aliases, and ambient/explicit `yt-dlp` config files into account.
+/// Rejects invocations whose effective `yt-dlp` output templates would stream media to stdout
+/// (`-o -`), evaluating active presets, extra arguments, aliases, and `yt-dlp` configuration files.
+///
+/// ## Bounded semantics
+///
+/// - Tracks each media output template type independently (`default`/untyped, `pl_video`, and
+///   `chapter`) so non-default templates (for example `-o chapter:chapter.mp4`) cannot mask an
+///   active `-o -` on another media template.
+/// - Evaluates `preset_args` and `extra_args` (up to `--`), `--alias` expansions (bounded to 64
+///   expansions), `--ignore-config`/`--no-config`, `--no-config-locations`, `--config-locations` /
+///   `--config-location` (and unambiguous `--config*` prefixes, bounded to depth 8 with canonical
+///   cycle detection), `-P`/`--paths` home directory `yt-dlp.conf`, and standard `yt-dlp`
+///   System/User/Home configuration locations.
+/// - Does not execute external `yt-dlp` plugins, read `--config-locations -` from stdin, expand
+///   dynamic shell/environment syntax, or resolve arbitrary `optparse` abbreviations beyond the
+///   recognized configuration and output options.
 pub fn ensure_no_media_to_stdout(
     request: &DownloadRequest,
     working_dir: &Path,
@@ -1390,21 +1390,48 @@ fn ensure_no_media_to_stdout_with_env(
         state.scan_tokens(&request.preset_args, &preset_label, false);
         state.scan_tokens(&request.extra_args, "command-line arguments", false);
     } else {
-        // First inspect CLI/preset args for `--ignore-config`, `--no-config`, `--alias`, and `--config-locations`.
+        // First inspect CLI/preset args for `--ignore-config`, `--no-config`, `--paths`,
+        // `--alias`, `--no-config-locations`, and `--config-locations` / `--config-location`.
         let mut discovery = EffectiveOutputScan::default();
         discovery.scan_tokens(&request.preset_args, &preset_label, true);
         discovery.scan_tokens(&request.extra_args, "command-line arguments", true);
 
+        let home_config_dir = discovery
+            .home_dir_override
+            .as_deref()
+            .map(|p| {
+                if p.is_relative() {
+                    working_dir.join(p)
+                } else {
+                    p.to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| working_dir.to_path_buf());
+
         let mut visited = BTreeSet::new();
         if !discovery.ignore_config {
-            for conf_path in default_yt_dlp_config_candidates(working_dir, get_env) {
-                if state.ignore_config {
+            // Upstream yt-dlp checks Home -> User -> System to stop early on `--ignore-config`,
+            // then applies surviving configs lowest-to-highest (System -> User -> Home).
+            let mut active_defaults = Vec::new();
+            for conf_path in default_yt_dlp_config_candidates_high_to_low(&home_config_dir, get_env)
+            {
+                if !conf_path.is_file() {
+                    continue;
+                }
+                let has_ignore = file_contains_ignore_config(&conf_path);
+                active_defaults.push(conf_path);
+                if has_ignore {
                     break;
                 }
+            }
+            for conf_path in active_defaults.into_iter().rev() {
                 load_config_file_recursive(&conf_path, working_dir, &mut visited, &mut state, 0);
             }
         }
         for explicit_conf in discovery.config_locations {
+            if explicit_conf == Path::new("-") {
+                continue;
+            }
             let resolved = resolve_config_location_path(&explicit_conf, working_dir);
             load_config_file_recursive(&resolved, working_dir, &mut visited, &mut state, 0);
         }
@@ -1413,10 +1440,10 @@ fn ensure_no_media_to_stdout_with_env(
         state.scan_tokens(&request.extra_args, "command-line arguments", false);
     }
 
-    if let Some((template, source_detail)) = state.effective_default_output
-        && is_stdout_output_template(&template)
-    {
-        return Err(DownloadError::MediaToStdoutDisallowed { source_detail });
+    for (template, source_detail) in state.media_output_templates.into_values() {
+        if is_stdout_output_template(&template) {
+            return Err(DownloadError::MediaToStdoutDisallowed { source_detail });
+        }
     }
     Ok(())
 }
@@ -1426,7 +1453,8 @@ struct EffectiveOutputScan {
     aliases: BTreeMap<String, Vec<String>>,
     ignore_config: bool,
     config_locations: Vec<PathBuf>,
-    effective_default_output: Option<(String, String)>,
+    home_dir_override: Option<PathBuf>,
+    media_output_templates: BTreeMap<String, (String, String)>,
 }
 
 impl EffectiveOutputScan {
@@ -1435,6 +1463,7 @@ impl EffectiveOutputScan {
         let mut queue: Vec<String> = tokens.to_vec();
         let mut i = 0usize;
         let mut expansions = 0usize;
+        let initial_config_len = self.config_locations.len();
 
         while i < queue.len() {
             let arg = queue[i].clone();
@@ -1463,6 +1492,9 @@ impl EffectiveOutputScan {
                     "ignore-config" | "no-config" => {
                         self.ignore_config = true;
                     }
+                    "no-config-locations" => {
+                        self.config_locations.truncate(initial_config_len);
+                    }
                     "config-locations" => {
                         let val = inline_val
                             .as_deref()
@@ -1470,6 +1502,15 @@ impl EffectiveOutputScan {
                             .or_else(|| queue.get(i + 1).cloned());
                         if let Some(path) = val {
                             self.config_locations.push(PathBuf::from(path));
+                        }
+                    }
+                    "paths" => {
+                        let val = inline_val
+                            .as_deref()
+                            .map(str::to_owned)
+                            .or_else(|| queue.get(i + 1).cloned());
+                        if let Some(raw_path) = val {
+                            self.record_home_path(&raw_path);
                         }
                     }
                     "alias" => {
@@ -1500,7 +1541,7 @@ impl EffectiveOutputScan {
             let shorts = &arg[1..];
             let mut extra_consumed = 0usize;
             for (idx, ch) in shorts.char_indices() {
-                if ch == 'o' {
+                if ch == 'o' || ch == 'P' {
                     let inline = &shorts[idx + ch.len_utf8()..];
                     let val = if inline.is_empty() {
                         extra_consumed = 1;
@@ -1508,8 +1549,14 @@ impl EffectiveOutputScan {
                     } else {
                         Some(inline.to_owned())
                     };
-                    if !discovery_only && let Some(template) = val {
-                        self.record_output_template(template, source_label);
+                    if let Some(val) = val {
+                        if ch == 'o' {
+                            if !discovery_only {
+                                self.record_output_template(val, source_label);
+                            }
+                        } else {
+                            self.record_home_path(&val);
+                        }
                     }
                     break;
                 }
@@ -1525,24 +1572,40 @@ impl EffectiveOutputScan {
         }
     }
 
+    fn record_home_path(&mut self, raw: &str) {
+        let (kind, rest) = split_yt_dlp_type_prefix(raw.trim());
+        if (kind.is_none() || kind.as_deref() == Some("home")) && !rest.is_empty() {
+            self.home_dir_override = Some(PathBuf::from(rest));
+        }
+    }
+
     fn record_output_template(&mut self, template: String, source_label: &str) {
         let (kind, _) = split_yt_dlp_type_prefix(template.trim());
-        if kind.is_none() || matches!(kind.as_deref(), Some("default" | "pl_video" | "chapter")) {
-            self.effective_default_output = Some((template, source_label.to_owned()));
-        }
+        let key = match kind.as_deref() {
+            None | Some("default") => "default",
+            Some("pl_video") => "pl_video",
+            Some("chapter") => "chapter",
+            Some(_) => return,
+        };
+        self.media_output_templates
+            .insert(key.to_owned(), (template, source_label.to_owned()));
     }
 }
 
 fn resolve_passthrough_long_flag(raw_name: &str) -> &str {
     match raw_name {
-        "ignore-config" | "no-config" | "config-locations" | "config-location" | "alias"
-        | "output" => raw_name,
-        "config" => "config-locations",
+        "ignore-config" | "no-config" | "no-config-locations" | "alias" | "output" | "paths" => {
+            raw_name
+        }
+        "config-locations" | "config-location" | "config" => "config-locations",
         other if "config-locations".starts_with(other) && other.len() >= "config".len() => {
             "config-locations"
         }
         other if "ignore-config".starts_with(other) && other.len() >= "ignore-con".len() => {
             "ignore-config"
+        }
+        other if "no-config-locations".starts_with(other) && other.len() >= "no-config-".len() => {
+            "no-config-locations"
         }
         other => other,
     }
@@ -1557,49 +1620,67 @@ fn is_stdout_output_template(raw: &str) -> bool {
     matches!(kind.as_deref(), Some("default" | "pl_video" | "chapter")) && rest.trim() == "-"
 }
 
-fn default_yt_dlp_config_candidates(
-    working_dir: &Path,
+fn default_yt_dlp_config_candidates_high_to_low(
+    home_config_dir: &Path,
     get_env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    #[cfg(not(windows))]
-    {
-        paths.push(PathBuf::from("/etc/yt-dlp.conf"));
-        paths.push(PathBuf::from("/etc/yt-dlp/config"));
-    }
-
+    let mut paths = vec![home_config_dir.join("yt-dlp.conf")];
     let non_empty_path = |key: &str| get_env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
 
     #[cfg(windows)]
     {
-        if let Some(appdata) = non_empty_path("APPDATA") {
-            paths.push(appdata.join("yt-dlp").join("config"));
-            paths.push(appdata.join("yt-dlp").join("config.txt"));
-        }
         if let Some(home) = non_empty_path("USERPROFILE").or_else(|| non_empty_path("HOME")) {
-            paths.push(home.join("yt-dlp.conf"));
+            paths.push(home.join(".yt-dlp").join("config.txt"));
+            paths.push(home.join(".yt-dlp").join("config"));
             paths.push(home.join("yt-dlp.conf.txt"));
+            paths.push(home.join("yt-dlp.conf"));
+        }
+        if let Some(appdata) = non_empty_path("APPDATA") {
+            paths.push(appdata.join("yt-dlp").join("config.txt"));
+            paths.push(appdata.join("yt-dlp").join("config"));
+            paths.push(appdata.join("yt-dlp.conf"));
         }
     }
 
     #[cfg(not(windows))]
     {
         let home = non_empty_path("HOME");
+        if let Some(home) = &home {
+            paths.push(home.join(".yt-dlp").join("config.txt"));
+            paths.push(home.join(".yt-dlp").join("config"));
+            paths.push(home.join("yt-dlp.conf.txt"));
+            paths.push(home.join("yt-dlp.conf"));
+        }
         if let Some(xdg) =
             non_empty_path("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config")))
         {
-            paths.push(xdg.join("yt-dlp").join("config"));
             paths.push(xdg.join("yt-dlp").join("config.txt"));
+            paths.push(xdg.join("yt-dlp").join("config"));
+            paths.push(xdg.join("yt-dlp.conf"));
         }
-        if let Some(home) = home {
-            paths.push(home.join(".config").join("yt-dlp.conf"));
-            paths.push(home.join("yt-dlp.conf"));
-            paths.push(home.join("yt-dlp.conf.txt"));
-        }
+        paths.push(PathBuf::from("/etc/yt-dlp/config.txt"));
+        paths.push(PathBuf::from("/etc/yt-dlp/config"));
+        paths.push(PathBuf::from("/etc/yt-dlp.conf"));
     }
 
-    paths.push(working_dir.join("yt-dlp.conf"));
     paths
+}
+
+fn file_contains_ignore_config(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let mut tokens = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        tokens.extend(tokenize_config_line(trimmed));
+    }
+    let mut scan = EffectiveOutputScan::default();
+    scan.scan_tokens(&tokens, "config", true);
+    scan.ignore_config
 }
 
 fn resolve_config_location_path(raw: &Path, working_dir: &Path) -> PathBuf {
@@ -2995,22 +3076,72 @@ mod tests {
         // Tracked uploads always pass `--ignore-config`, so ambient `yt-dlp.conf` does not apply.
         let pending = pending_request(vec![], vec![]);
         assert!(ensure_no_media_to_stdout_with_env(&pending, &work_dir, &env_lookup).is_ok());
-
-        // Explicit `--config-locations` (even with `--ignore-config`) and `--alias` expansions are checked.
         fs::remove_file(work_dir.join("yt-dlp.conf")).unwrap();
+
+        // Independent per-type media output templates: non-default types cannot mask an active `-o -`.
+        for masked in [
+            vec!["-o", "-", "-o", "chapter:chapter.mp4"],
+            vec!["-o", "chapter:-", "-o", "out.mp4"],
+            vec!["-o", "pl_video:-", "-o", "out.mp4"],
+        ] {
+            let req = direct_request(vec![], masked.clone());
+            assert!(
+                matches!(
+                    ensure_no_media_to_stdout_with_env(&req, &work_dir, &env_lookup),
+                    Err(DownloadError::MediaToStdoutDisallowed { .. })
+                ),
+                "expected refusal for {masked:?}"
+            );
+        }
+        let chapter_overridden =
+            direct_request(vec![], vec!["-o", "chapter:-", "-o", "chapter:ok.mp4"]);
+        assert!(
+            ensure_no_media_to_stdout_with_env(&chapter_overridden, &work_dir, &env_lookup).is_ok()
+        );
+
+        // Explicit `--config-location` (singular), `--config-locations`, `--no-config-locations`,
+        // `--paths` home config, and Home `--ignore-config` blocking User config.
         let custom_conf = temp.path().join("pipe.conf");
         fs::write(&custom_conf, "--alias --pipe \"-o -\"\n--pipe\n").unwrap();
-        let explicit_conf = direct_request(
+        for flag in ["--config-locations", "--config-location"] {
+            let explicit_conf = direct_request(
+                vec![],
+                vec!["--ignore-config", flag, custom_conf.to_str().unwrap()],
+            );
+            assert!(
+                matches!(
+                    ensure_no_media_to_stdout_with_env(&explicit_conf, &work_dir, &env_lookup),
+                    Err(DownloadError::MediaToStdoutDisallowed { .. })
+                ),
+                "expected refusal for {flag}"
+            );
+        }
+        let cleared_conf = direct_request(
             vec![],
             vec![
                 "--ignore-config",
-                "--config-locations",
+                "--config-location",
                 custom_conf.to_str().unwrap(),
+                "--no-config-locations",
             ],
         );
+        assert!(ensure_no_media_to_stdout_with_env(&cleared_conf, &work_dir, &env_lookup).is_ok());
+
+        // User config `-o -` is shadowed by Home (`-P home:...`) `yt-dlp.conf` overriding or ignoring it.
+        let user_conf_dir = home_dir.join(".config").join("yt-dlp");
+        fs::create_dir_all(&user_conf_dir).unwrap();
+        fs::write(user_conf_dir.join("config"), "-o -\n").unwrap();
+        let user_only = direct_request(vec![], vec![]);
         assert!(matches!(
-            ensure_no_media_to_stdout_with_env(&explicit_conf, &work_dir, &env_lookup),
+            ensure_no_media_to_stdout_with_env(&user_only, &work_dir, &env_lookup),
             Err(DownloadError::MediaToStdoutDisallowed { .. })
         ));
+        let paths_home = temp.path().join("paths-home");
+        fs::create_dir_all(&paths_home).unwrap();
+        fs::write(paths_home.join("yt-dlp.conf"), "--ignore-config\n").unwrap();
+        let home_ignores_user = direct_request(vec![], vec!["-P", paths_home.to_str().unwrap()]);
+        assert!(
+            ensure_no_media_to_stdout_with_env(&home_ignores_user, &work_dir, &env_lookup).is_ok()
+        );
     }
 }

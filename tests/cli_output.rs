@@ -304,21 +304,58 @@ fn json_mode_covers_help_version_and_argument_config_bootstrap_failures() {
         "http://127.0.0.1:1".into(),
     );
 
-    // 1. Help (root, subcommand, nested subcommand, and `help <subcommand>`).
-    for help_args in [
-        &["--json", "--help"][..],
-        &["--help", "--json"],
-        &["--json", "help"],
-        &["creator", "--json", "--help"],
-        &["--json", "creator", "add", "--help"],
-        &["--json", "help", "download"],
+    // 1. Help (root, subcommand, nested subcommand, flags before/after command, and `help <subcommand>`).
+    for (json_args, plain_args, expected_cmd) in [
+        (&["--json", "--help"][..], &["--help"][..], "siphon"),
+        (&["--help", "--json"], &["--help"], "siphon"),
+        (
+            &["--json", "--help", "creator", "list"],
+            &["--help", "creator", "list"],
+            "siphon",
+        ),
+        (&["--json", "help"], &["help"], "siphon"),
+        (
+            &["creator", "--json", "--help"],
+            &["creator", "--help"],
+            "siphon creator",
+        ),
+        (
+            &["--json", "creator", "list", "--help"],
+            &["creator", "list", "--help"],
+            "siphon creator list",
+        ),
+        (
+            &["creator", "list", "--json", "--help"],
+            &["creator", "list", "--help"],
+            "siphon creator list",
+        ),
+        (
+            &["--json", "creator", "add", "--help"],
+            &["creator", "add", "--help"],
+            "siphon creator add",
+        ),
+        (
+            &["--json", "help", "download"],
+            &["help", "download"],
+            "siphon download",
+        ),
     ] {
-        let out = runner.run_raw(help_args, &[]);
-        assert!(out.status.success(), "help failed for {help_args:?}");
-        assert!(out.stderr.is_empty(), "help wrote stderr for {help_args:?}");
+        let out = runner.run_raw(json_args, &[]);
+        let plain_out = runner.run_raw(plain_args, &[]);
+        assert!(out.status.success(), "help failed for {json_args:?}");
+        assert!(
+            plain_out.status.success(),
+            "plain help failed for {plain_args:?}"
+        );
+        assert!(out.stderr.is_empty(), "help wrote stderr for {json_args:?}");
         let json = parse_single_json_stdout(&out);
         assert_eq!(json["ok"], true);
         assert!(json["error"].is_null());
+        assert_eq!(json["data"]["command"], expected_cmd);
+        assert_eq!(
+            json["data"]["help_text"].as_str().unwrap(),
+            String::from_utf8_lossy(&plain_out.stdout)
+        );
         assert!(json["data"]["usage"].is_string());
         assert!(json["data"]["options"].is_array());
         assert!(json["data"]["subcommands"].is_array());
@@ -365,6 +402,7 @@ fn json_mode_covers_help_version_and_argument_config_bootstrap_failures() {
         &["--json", "creator", "remove", "0"],
         &["--json", "download", "--upload", "0"],
         &["--json", "--db", "  ", "creator", "list"],
+        &["--db", "--json", "creator", "list"],
     ] {
         let out = runner.run_raw(bad_args, &[]);
         assert_eq!(out.status.code(), Some(2), "args={bad_args:?}");
@@ -601,21 +639,45 @@ fn json_and_human_workflows_handle_all_commands_partial_refresh_and_download_str
     assert_eq!(preset_list["ok"], true);
     assert!(preset_list["data"]["presets"].as_array().unwrap().len() >= 3);
 
-    // 6. Media-to-stdout refusal in `--json` mode across CLI, preset, and yt-dlp.conf.
+    // 6. Media-to-stdout refusal in `--json` mode across CLI, per-type templates, preset,
+    //    `--config-location`, and `yt-dlp.conf`.
     let logs_before_refusal = read_stub_log(&log_path).len();
-    let refused_cli = runner.run_with_db(&[
+    for cli_pipe_args in [
+        &["-o", "-"][..],
+        &["-o", "-", "-o", "chapter:chapter.mp4"],
+        &["-o", "chapter:-", "-o", "out.mp4"],
+    ] {
+        let mut argv = vec![
+            "--json",
+            "download",
+            "https://www.bilibili.com/video/BV1pipe",
+            "--",
+        ];
+        argv.extend_from_slice(cli_pipe_args);
+        let refused_cli = runner.run_with_db(&argv);
+        assert_eq!(refused_cli.status.code(), Some(1), "args={cli_pipe_args:?}");
+        let refused_cli_json = parse_single_json_stdout(&refused_cli);
+        assert_eq!(refused_cli_json["ok"], false);
+        assert_eq!(
+            refused_cli_json["error"]["code"],
+            "media_to_stdout_not_allowed"
+        );
+    }
+
+    let singular_conf = temp.path().join("singular.conf");
+    fs::write(&singular_conf, "-o -\n").unwrap();
+    let refused_singular_conf = runner.run_with_db(&[
         "--json",
         "download",
-        "https://www.bilibili.com/video/BV1pipe",
+        "https://www.bilibili.com/video/BV1singularconf",
         "--",
-        "-o",
-        "-",
+        "--ignore-config",
+        "--config-location",
+        singular_conf.to_str().unwrap(),
     ]);
-    assert_eq!(refused_cli.status.code(), Some(1));
-    let refused_cli_json = parse_single_json_stdout(&refused_cli);
-    assert_eq!(refused_cli_json["ok"], false);
+    assert_eq!(refused_singular_conf.status.code(), Some(1));
     assert_eq!(
-        refused_cli_json["error"]["code"],
+        parse_single_json_stdout(&refused_singular_conf)["error"]["code"],
         "media_to_stdout_not_allowed"
     );
 

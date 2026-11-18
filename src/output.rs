@@ -612,6 +612,8 @@ pub struct HelpData {
     pub long_about: Option<String>,
     /// Usage synopsis for this command.
     pub usage: String,
+    /// Rendered plain-text help output produced by `clap`.
+    pub help_text: String,
     /// Visible child subcommands.
     pub subcommands: Vec<HelpSubcommandDto>,
     /// Visible positional arguments.
@@ -677,20 +679,44 @@ pub struct HelpOptionDto {
 }
 
 impl HelpData {
+    /// Extracts structured command metadata and rendered help text directly from a `clap`
+    /// `DisplayHelp` error, guaranteeing parity with non-JSON `--help` / `-h` resolution.
+    #[must_use]
+    pub fn from_clap_help_error(err: &clap::Error) -> Self {
+        let help_text = strip_ansi(&err.to_string());
+        let usage_line = extract_usage_line(&help_text);
+        let (path, cmd) =
+            crate::cli::resolve_command_from_usage(usage_line.as_deref().unwrap_or("siphon"));
+        Self::from_clap_command_with_text(&path, &cmd, Some(help_text), usage_line)
+    }
+
     /// Extracts structured command metadata from a [`clap::Command`] and its resolved path.
     #[must_use]
     pub fn from_clap_command(path: &[String], cmd: &clap::Command) -> Self {
+        Self::from_clap_command_with_text(path, cmd, None, None)
+    }
+
+    fn from_clap_command_with_text(
+        path: &[String],
+        cmd: &clap::Command,
+        rendered_help: Option<String>,
+        rendered_usage: Option<String>,
+    ) -> Self {
         let mut build_cmd = cmd.clone();
         if path.len() > 1 {
             build_cmd = build_cmd.bin_name(path.join(" "));
         }
         build_cmd.build();
 
-        let raw_usage = strip_ansi(&build_cmd.render_usage().to_string());
-        let usage = raw_usage
-            .trim()
-            .strip_prefix("Usage:")
-            .map_or_else(|| raw_usage.trim().to_owned(), |s| s.trim().to_owned());
+        let help_text =
+            rendered_help.unwrap_or_else(|| strip_ansi(&build_cmd.render_long_help().to_string()));
+        let usage = rendered_usage.unwrap_or_else(|| {
+            let raw_usage = strip_ansi(&build_cmd.render_usage().to_string());
+            raw_usage
+                .trim()
+                .strip_prefix("Usage:")
+                .map_or_else(|| raw_usage.trim().to_owned(), |s| s.trim().to_owned())
+        });
 
         let subcommands = build_cmd
             .get_subcommands()
@@ -759,6 +785,7 @@ impl HelpData {
             about: build_cmd.get_about().map(ToString::to_string),
             long_about: build_cmd.get_long_about().map(ToString::to_string),
             usage,
+            help_text,
             subcommands,
             arguments,
             options,
@@ -1916,11 +1943,44 @@ mod tests {
     fn clap_help_and_errors_serialize_as_structured_json_without_ansi() {
         let help = HelpData::from_clap_command(&["siphon".to_owned()], &Cli::command());
         assert_eq!(help.command, "siphon");
+        assert!(help.help_text.contains("Usage: siphon"));
         assert!(help.subcommands.iter().any(|s| s.name == "download"));
         assert!(
             help.options
                 .iter()
                 .any(|o| o.long.as_deref() == Some("--json"))
+        );
+
+        // `siphon --json --help creator list` must match `siphon --help creator list` (root help).
+        let json_root_help_err =
+            Cli::try_parse_from(["siphon", "--json", "--help", "creator", "list"]).unwrap_err();
+        let plain_root_help_err =
+            Cli::try_parse_from(["siphon", "--help", "creator", "list"]).unwrap_err();
+        let json_root_help = HelpData::from_clap_help_error(&json_root_help_err);
+        assert_eq!(json_root_help.command, "siphon");
+        assert_eq!(
+            json_root_help.help_text,
+            strip_ansi(&plain_root_help_err.to_string())
+        );
+
+        // Nested help with `--json` before or after the subcommand resolves `siphon creator list`.
+        let nested_before =
+            Cli::try_parse_from(["siphon", "--json", "creator", "list", "--help"]).unwrap_err();
+        let nested_after =
+            Cli::try_parse_from(["siphon", "creator", "list", "--json", "--help"]).unwrap_err();
+        let nested_plain =
+            Cli::try_parse_from(["siphon", "creator", "list", "--help"]).unwrap_err();
+        let nested_before_data = HelpData::from_clap_help_error(&nested_before);
+        let nested_after_data = HelpData::from_clap_help_error(&nested_after);
+        assert_eq!(nested_before_data.command, "siphon creator list");
+        assert_eq!(nested_after_data.command, "siphon creator list");
+        assert_eq!(
+            nested_before_data.help_text,
+            strip_ansi(&nested_plain.to_string())
+        );
+        assert_eq!(
+            nested_after_data.help_text,
+            strip_ansi(&nested_plain.to_string())
         );
 
         let missing_sub = Cli::try_parse_from(["siphon", "--json"]).unwrap_err();

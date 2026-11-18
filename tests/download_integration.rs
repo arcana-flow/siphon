@@ -423,6 +423,42 @@ fn run_cli(services: &AppServices<'_>, argv: &[&str]) -> Result<String, AppError
     execute(cli, services).map(|out| out.stdout)
 }
 
+fn assert_manifest_prefix_and_tail(args: &[String], expected_tail: &[&str]) {
+    assert!(
+        args.len() >= 6,
+        "expected manifest --print-to-file prefix in {args:?}"
+    );
+    assert_eq!(args[0], "--print-to-file");
+    assert!(args[1].starts_with("after_move:"));
+    assert_eq!(args[3], "--print-to-file");
+    assert!(args[4].starts_with("after_video:"));
+    assert_eq!(args[2], args[5]);
+    assert_eq!(&args[6..], expected_tail);
+}
+
+#[cfg(unix)]
+struct UnreadableDirGuard {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnreadableDirGuard {
+    fn new(path: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(&path).expect("create locked subdir");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        Self { path }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnreadableDirGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o755));
+    }
+}
+
 #[test]
 fn preserves_argv_order_no_preset_and_shell_metacharacters_without_shell() {
     let ws = TempWorkspace::new("argv-order");
@@ -494,11 +530,26 @@ fn preserves_argv_order_no_preset_and_shell_metacharacters_without_shell() {
     )
     .unwrap();
 
+    // `--help` passthrough omits `--print-to-file` injection and completes cleanly.
+    let help_out = run_cli(
+        &services,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1help",
+            "--no-preset",
+            "--",
+            "--help",
+        ],
+    )
+    .unwrap();
+    assert!(help_out.contains("without confirmed output artifact"));
+
     let logs = read_stub_log(&log_path);
-    assert_eq!(logs.len(), 2);
-    assert_eq!(
-        logs[0].args,
-        vec![
+    assert_eq!(logs.len(), 3);
+    assert_manifest_prefix_and_tail(
+        &logs[0].args,
+        &[
             "-x",
             "--audio-format",
             "mp3",
@@ -507,16 +558,20 @@ fn preserves_argv_order_no_preset_and_shell_metacharacters_without_shell() {
             "--no-overwrites",
             "--",
             tricky_url,
-        ]
+        ],
     );
-    assert_eq!(
-        logs[1].args,
-        vec![
+    assert_manifest_prefix_and_tail(
+        &logs[1].args,
+        &[
             "-f",
             "worst",
             "--",
             "https://www.bilibili.com/video/BV1nopreset",
-        ]
+        ],
+    );
+    assert_eq!(
+        logs[2].args,
+        vec!["--help", "--", "https://www.bilibili.com/video/BV1help",]
     );
 }
 
@@ -631,47 +686,47 @@ fn respects_explicit_cookies_and_ignores_saved_refresh_default() {
 
     let logs = read_stub_log(&log_path);
     assert_eq!(logs.len(), 4);
-    assert_eq!(
-        logs[0].args,
-        vec![
+    assert_manifest_prefix_and_tail(
+        &logs[0].args,
+        &[
             "-f",
             "bv*+ba/b",
             "--",
             "https://www.bilibili.com/video/BV1nocookie",
-        ]
+        ],
     );
-    assert_eq!(
-        logs[1].args,
-        vec![
+    assert_manifest_prefix_and_tail(
+        &logs[1].args,
+        &[
             "-f",
             "bv*+ba/b",
             "--cookies",
             &cookie_str,
             "--",
             "https://www.bilibili.com/video/BV1filecookie",
-        ]
+        ],
     );
-    assert_eq!(
-        logs[2].args,
-        vec![
+    assert_manifest_prefix_and_tail(
+        &logs[2].args,
+        &[
             "-f",
             "bv*+ba/b",
             "--cookies-from-browser",
             "firefox:default",
             "--",
             "https://www.bilibili.com/video/BV1browser",
-        ]
+        ],
     );
-    assert_eq!(
-        logs[3].args,
-        vec![
+    assert_manifest_prefix_and_tail(
+        &logs[3].args,
+        &[
             "--cookies-from-browser",
             "chrome",
             "--cookies",
             &cookie_str,
             "--",
             "https://www.bilibili.com/video/BV1overridecookie",
-        ]
+        ],
     );
 }
 
@@ -751,8 +806,15 @@ fn isolates_tracked_uploads_from_playlist_config_and_multi_target_args() {
     );
     assert!(work_dir.join("Stub Video [BV1playlist].mp4").is_file());
 
-    // Direct URL download is NOT restricted: --yes-playlist expands playlist, --batch-file works,
-    // and --config-locations works.
+    // Direct URL download is NOT restricted: --yes-playlist expands playlist, --batch-file,
+    // --config-locations, --alias, and yt-dlp optparse prefix abbreviations all pass through.
+    let direct_batch_file = ws.path().join("direct-batch.txt");
+    fs::write(&direct_batch_file, "https://example.com/batch-abbrev\n").unwrap();
+    let direct_conf = ws.path().join("direct-abbrev.conf");
+    fs::write(&direct_conf, "https://example.com/conf-abbrev\n").unwrap();
+    let direct_info = ws.path().join("direct-info.json");
+    fs::write(&direct_info, "https://example.com/info-abbrev\n").unwrap();
+
     let direct_out = run_cli(
         &services,
         &[
@@ -766,6 +828,13 @@ fn isolates_tracked_uploads_from_playlist_config_and_multi_target_args() {
             &batch_file.to_string_lossy(),
             "--config-locations",
             &custom_conf.to_string_lossy(),
+            "--alias",
+            "--aliased-url",
+            "https://example.com/from-alias",
+            "--aliased-url",
+            &format!("--batch={}", direct_batch_file.display()),
+            &format!("--config={}", direct_conf.display()),
+            &format!("--load-info={}", direct_info.display()),
         ],
     )
     .unwrap();
@@ -782,8 +851,13 @@ fn isolates_tracked_uploads_from_playlist_config_and_multi_target_args() {
     );
     assert!(work_dir.join("Stub Video [batch-1].mp4").is_file());
     assert!(work_dir.join("Stub Video [from-custom-conf].mp4").is_file());
+    assert!(work_dir.join("Stub Video [from-alias].mp4").is_file());
+    assert!(work_dir.join("Stub Video [batch-abbrev].mp4").is_file());
+    assert!(work_dir.join("Stub Video [conf-abbrev].mp4").is_file());
+    assert!(work_dir.join("Stub Video [info-abbrev].mp4").is_file());
 
-    // Multi-target / target-displacing args on another pending upload are rejected pre-spawn.
+    // Multi-target / target-displacing args, aliases, abbreviations, and unknown flags on a
+    // pending upload are all rejected pre-spawn.
     let guarded = storage.seed_pending_upload(
         "BV1guarded",
         "https://www.bilibili.com/video/BV1guarded",
@@ -791,16 +865,30 @@ fn isolates_tracked_uploads_from_playlist_config_and_multi_target_args() {
     );
     let log_count_before = read_stub_log(&log_path).len();
     let batch_str = batch_file.to_string_lossy().into_owned();
+    let batch_eq = format!("--batch={batch_str}");
     let conf_str = custom_conf.to_string_lossy().into_owned();
+    let conf_eq = format!("--config={conf_str}");
+    let load_info_eq = format!("--load-info={}", direct_info.display());
     let rejected_cases: Vec<Vec<&str>> = vec![
         vec!["--", "https://other.example/video"],
         vec!["https://other.example/video"],
         vec!["-f", "best", "https://other.example/video"],
         vec!["--batch-file", &batch_str],
+        vec!["--batch", &batch_str],
+        vec![&batch_eq],
         vec!["-a", &batch_str],
         vec!["-qa", &batch_str],
         vec!["--config-locations", &conf_str],
+        vec!["--config-loc", &conf_str],
+        vec![&conf_eq],
         vec!["--load-info-json", "other.info.json"],
+        vec![&load_info_eq],
+        vec!["--alias", "--x", "--batch-file batch.txt"],
+        vec!["--ali", "--x", "https://other.example/video"],
+        vec!["--unknown-flag"],
+        vec!["--unknown-flag=val"],
+        vec!["--simulate=yes"],
+        vec!["-z"],
         vec!["-f"],
     ];
 
@@ -856,7 +944,8 @@ fn subtitle_only_downloads_confirm_subtitles_and_reject_missing_subs_or_thumbnai
         downloader: &downloader,
     };
 
-    // 1. Subtitle-only download that saves `.en.srt` marks upload as Downloaded.
+    // 1. Quiet subtitle-only download that saves `.en.srt` marks upload as Downloaded via
+    // downloader-reported manifest paths.
     let out = run_cli(
         &services,
         &[
@@ -866,6 +955,7 @@ fn subtitle_only_downloads_confirm_subtitles_and_reject_missing_subs_or_thumbnai
             &upload_ok.id.to_string(),
             "--no-preset",
             "--",
+            "-q",
             "--skip-download",
             "--write-subs",
             "--convert-subs",
@@ -1008,32 +1098,6 @@ fn simulation_leaves_upload_pending_even_when_old_file_exists_on_disk() {
         storage.get_upload(upload.id).unwrap().status,
         UploadStatus::Downloaded
     );
-
-    // 5. Existing matching file reported via `--no-overwrites` (`has already been downloaded`)
-    // also confirms and marks a new pending upload as Downloaded.
-    let existing_upload = storage.seed_pending_upload(
-        "BV1already",
-        "https://www.bilibili.com/video/BV1already",
-        "Already Present",
-    );
-    fs::write(work_dir.join("Stub Video [BV1already].mp4"), b"existing").unwrap();
-    let already_out = run_cli(
-        &services,
-        &[
-            "siphon",
-            "download",
-            "--upload",
-            &existing_upload.id.to_string(),
-            "--",
-            "--no-overwrites",
-        ],
-    )
-    .unwrap();
-    assert!(already_out.contains("marked as downloaded"));
-    assert_eq!(
-        storage.get_upload(existing_upload.id).unwrap().status,
-        UploadStatus::Downloaded
-    );
 }
 
 #[test]
@@ -1086,11 +1150,25 @@ fn mismatched_or_absent_artifacts_and_direct_url_keep_upload_pending() {
         UploadStatus::Pending
     );
 
-    // 3. Stub exits 0 silently without writing any artifact -> stays pending.
+    // 3. Stub exits 0 silently without writing any artifact -> stays pending, EVEN when an
+    // unrelated concurrent file matching a custom `-o` prefix exists on disk.
+    fs::create_dir_all(&custom_dir).unwrap();
+    fs::write(custom_dir.join("custom_clip_concurrent.mp4"), b"concurrent").unwrap();
+    fs::write(custom_dir.join("custom_clip.mp4"), b"preexisting-custom").unwrap();
     write_stub_config(&work_dir, &[("SIPHON_STUB_MODE", "silent_no_artifact")]);
     let empty_out = run_cli(
         &services,
-        &["siphon", "download", "--upload", &upload.id.to_string()],
+        &[
+            "siphon",
+            "download",
+            "--upload",
+            &upload.id.to_string(),
+            "--",
+            "-P",
+            &custom_dir.to_string_lossy(),
+            "-o",
+            "custom_clip.%(ext)s",
+        ],
     )
     .unwrap();
     assert!(empty_out.contains("remains pending"));
@@ -1100,7 +1178,9 @@ fn mismatched_or_absent_artifacts_and_direct_url_keep_upload_pending() {
     );
 
     // 4. Quiet download (`-q`) with `-P <dir>` and `-o custom_clip.%(ext)s` confirms artifact via
-    // snapshot diff and custom template matching.
+    // manifest attribution even with an unreadable subdirectory inside `work_dir`.
+    #[cfg(unix)]
+    let _locked_dir = UnreadableDirGuard::new(work_dir.join("locked-unrelated-subdir"));
     write_stub_config(&work_dir, &[("SIPHON_STUB_MODE", "normal")]);
     let quiet_out = run_cli(
         &services,
@@ -1124,6 +1204,18 @@ fn mismatched_or_absent_artifacts_and_direct_url_keep_upload_pending() {
         storage.get_upload(upload.id).unwrap().status,
         UploadStatus::Downloaded
     );
+
+    // Direct URL download also succeeds when an unrelated unreadable subdirectory exists.
+    let direct_locked = run_cli(
+        &services,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1lockedok",
+        ],
+    )
+    .unwrap();
+    assert!(direct_locked.contains("Downloaded direct URL"));
 
     // 5. Existing matching file reported via `--no-overwrites` (`has already been downloaded`)
     // also confirms and marks a new pending upload as Downloaded.

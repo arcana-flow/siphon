@@ -1,12 +1,12 @@
 //! Media download integration contract, preset resolution, `yt-dlp` execution, and artifact rules.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain::{CookieSource, PresetName, Upload, UploadId, UploadStatus};
 use crate::error::{AppError, DownloadError, StorageError};
@@ -14,6 +14,8 @@ use crate::storage::Storage;
 
 /// Default executable name used to invoke `yt-dlp`.
 pub const DEFAULT_YT_DLP_BINARY: &str = "yt-dlp";
+
+static NEXT_MANIFEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Known `yt-dlp` output/path type prefixes used in `-P TYPE:PATH` and `-o TYPE:TEMPLATE`.
 const YT_DLP_PATH_TYPES: &[&str] = &[
@@ -395,13 +397,32 @@ impl YtDlpDownloader {
         }
     }
 
-    fn build_child_argv(&self, request: &DownloadRequest) -> Result<Vec<OsString>, DownloadError> {
+    fn build_child_argv(
+        &self,
+        request: &DownloadRequest,
+        manifest_path: Option<&Path>,
+    ) -> Result<Vec<OsString>, DownloadError> {
         request.validate()?;
         let cookie_args = self.prepare_cookie_args(request.cookies.as_ref())?;
 
         let mut argv = Vec::with_capacity(
-            request.preset_args.len() + request.extra_args.len() + cookie_args.len() + 4,
+            request.preset_args.len() + request.extra_args.len() + cookie_args.len() + 10,
         );
+        if let Some(manifest) = manifest_path {
+            let escaped_manifest = escape_yt_dlp_outtmpl_literal(manifest);
+            argv.push(OsString::from("--print-to-file"));
+            argv.push(OsString::from(
+                "after_move:{\"kind\":\"media\",\"id\":%(id)j,\"path\":%(filepath)j}",
+            ));
+            argv.push(escaped_manifest.clone());
+
+            argv.push(OsString::from("--print-to-file"));
+            argv.push(OsString::from(
+                "after_video:{\"kind\":\"subtitles\",\"id\":%(id)j,\"subtitles\":%(requested_subtitles.:.filepath)j}",
+            ));
+            argv.push(escaped_manifest);
+        }
+
         for arg in &request.preset_args {
             argv.push(OsString::from(arg));
         }
@@ -421,17 +442,20 @@ impl YtDlpDownloader {
 
 impl Downloader for YtDlpDownloader {
     fn download(&self, request: &DownloadRequest) -> Result<DownloadOutcome, DownloadError> {
-        let argv = self.build_child_argv(request)?;
+        request.validate()?;
         let effective_working_dir = self.resolve_effective_working_dir()?;
         let forwarded = request.forward_args();
         let mode = InvocationMode::from_args(&forwarded);
-        let output_spec = OutputSearchSpec::from_args(&forwarded, &effective_working_dir);
+        let attach_manifest = !has_help_or_version(&forwarded);
 
-        let pre_snapshot = if mode.expects_artifacts() {
-            Some(snapshot_roots(&output_spec.search_roots)?)
+        let manifest_guard = if attach_manifest {
+            Some(TempManifestFile::create()?)
         } else {
             None
         };
+
+        let argv =
+            self.build_child_argv(request, manifest_guard.as_ref().map(TempManifestFile::path))?;
 
         // Pass each argument directly without invoking a shell.
         let mut command = Command::new(&self.binary);
@@ -465,22 +489,31 @@ impl Downloader for YtDlpDownloader {
             });
         }
 
-        let Some(pre) = pre_snapshot else {
+        if !mode.expects_artifacts() {
             return Ok(DownloadOutcome {
                 succeeded: true,
                 confirmed_artifacts: Vec::new(),
             });
+        }
+
+        let manifest_contents = match &manifest_guard {
+            Some(guard) => fs::read_to_string(guard.path()).map_err(|err| {
+                DownloadError::Io(format!(
+                    "failed to read downloader artifact manifest '{}': {err}",
+                    guard.path().display()
+                ))
+            })?,
+            None => String::new(),
         };
 
-        let post = snapshot_roots(&output_spec.search_roots)?;
         let stdout_text = String::from_utf8_lossy(&output.stdout);
-        let confirmed_artifacts = confirm_artifacts(
+        let path_hints = OutputPathHints::from_args(&forwarded, &effective_working_dir);
+        let confirmed_artifacts = confirm_reported_artifacts(
             &request.target,
             mode,
-            &output_spec,
+            &path_hints,
             &effective_working_dir,
-            &pre,
-            &post,
+            &manifest_contents,
             &stdout_text,
         );
 
@@ -563,6 +596,54 @@ pub fn execute_download(
     })
 }
 
+struct TempManifestFile {
+    path: PathBuf,
+}
+
+impl TempManifestFile {
+    fn create() -> Result<Self, DownloadError> {
+        let dir = std::env::temp_dir();
+        for _ in 0..32 {
+            let seq = NEXT_MANIFEST_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = dir.join(format!("siphon-yt-dlp-{}-{seq}.jsonl", std::process::id()));
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&candidate)
+            {
+                Ok(_) => return Ok(Self { path: candidate }),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(DownloadError::Io(format!(
+                        "failed to create downloader manifest file '{}': {err}",
+                        candidate.display()
+                    )));
+                }
+            }
+        }
+        Err(DownloadError::Io(
+            "failed to allocate unique downloader manifest file".to_owned(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempManifestFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn escape_yt_dlp_outtmpl_literal(path: &Path) -> OsString {
+    match path.to_str() {
+        Some(utf8) => OsString::from(utf8.replace('%', "%%")),
+        None => path.as_os_str().to_os_string(),
+    }
+}
+
 fn ensure_no_nul(label: &str, value: &str) -> Result<(), DownloadError> {
     if value.contains('\0') {
         return Err(DownloadError::InvalidArguments {
@@ -614,23 +695,23 @@ fn validate_single_target_slice(args: &[String], source: &str) -> Result<(), Dow
                 None => (rest, false),
             };
             let full_flag = format!("--{flag_name}");
-            if matches!(
-                flag_name,
-                "batch-file" | "config-locations" | "config-location" | "load-info-json"
-            ) {
+            let Some(arity) = allowed_long_option_arity(flag_name) else {
                 return Err(DownloadError::InvalidArguments {
                     reason: format!(
-                        "{source} option '{full_flag}' is not allowed when downloading a tracked upload"
+                        "{source} option '{full_flag}' is not permitted when downloading a tracked upload"
+                    ),
+                });
+            };
+            if has_eq && arity != 1 {
+                return Err(DownloadError::InvalidArguments {
+                    reason: format!(
+                        "{source} option '{full_flag}' does not accept '=' inline syntax"
                     ),
                 });
             }
-
-            if !has_eq {
-                let arity = long_option_arity(&full_flag);
-                if arity > 0 {
-                    expect_values = arity;
-                    active_flag = full_flag;
-                }
+            if !has_eq && arity > 0 {
+                expect_values = arity;
+                active_flag = full_flag;
             }
             continue;
         }
@@ -638,17 +719,17 @@ fn validate_single_target_slice(args: &[String], source: &str) -> Result<(), Dow
         // Short option (possibly bundled, e.g. `-qf best` or `-fbest`).
         let shorts = &arg[1..];
         for (idx, ch) in shorts.char_indices() {
-            if ch == 'a' {
+            let Some(arity) = allowed_short_option_arity(ch) else {
                 return Err(DownloadError::InvalidArguments {
                     reason: format!(
-                        "{source} option '-a' (--batch-file) is not allowed when downloading a tracked upload"
+                        "{source} short option '-{ch}' is not permitted when downloading a tracked upload"
                     ),
                 });
-            }
-            if short_option_takes_arg(ch) {
+            };
+            if arity > 0 {
                 let has_inline_value = idx + ch.len_utf8() < shorts.len();
                 if !has_inline_value {
-                    expect_values = 1;
+                    expect_values = arity;
                     active_flag = format!("-{ch}");
                 }
                 break;
@@ -667,120 +748,341 @@ fn validate_single_target_slice(args: &[String], source: &str) -> Result<(), Dow
     Ok(())
 }
 
-fn short_option_takes_arg(ch: char) -> bool {
-    matches!(
-        ch,
-        'a' | 'f' | 'I' | 'N' | 'o' | 'O' | 'p' | 'P' | 'r' | 'R' | 'S' | 't' | 'u' | '2'
-    )
+/// Strict allowlist of safe canonical `yt-dlp` short options for `--upload <ID>`.
+///
+/// Explicitly rejects `-a` (`--batch-file`) and any unknown short option letters.
+fn allowed_short_option_arity(ch: char) -> Option<usize> {
+    match ch {
+        'h' | 'U' | 'i' | 'q' | 'v' | 's' | 'j' | 'J' | 'g' | 'e' | 'F' | 'x' | 'k' | 'w' | 'c'
+        | '4' | '6' | 'K' | 'X' => Some(0),
+        'f' | 'I' | 'N' | 'o' | 'O' | 'p' | 'P' | 'r' | 'R' | 'S' | 't' | 'u' | '2' => Some(1),
+        _ => None,
+    }
 }
 
-fn long_option_arity(flag: &str) -> usize {
-    match flag {
-        "--print-to-file" | "--parse-metadata" | "--alias" => 2,
-        "--replace-in-metadata" => 3,
-        "--config-locations"
-        | "--config-location"
-        | "--plugin-dirs"
-        | "--js-runtimes"
-        | "--remote-components"
-        | "--proxy"
-        | "--socket-timeout"
-        | "--source-address"
-        | "--impersonate"
-        | "--geo-verification-proxy"
-        | "--xff"
-        | "--color"
-        | "--compat-options"
-        | "--playlist-items"
-        | "--playlist-start"
-        | "--playlist-end"
-        | "--min-filesize"
-        | "--max-filesize"
-        | "--date"
-        | "--datebefore"
-        | "--dateafter"
-        | "--match-filters"
-        | "--match-filter"
-        | "--age-limit"
-        | "--download-archive"
-        | "--max-downloads"
-        | "--break-match-filters"
-        | "--concurrent-fragments"
-        | "--limit-rate"
-        | "--retries"
-        | "--file-access-retries"
-        | "--fragment-retries"
-        | "--extractor-retries"
-        | "--retry-sleep"
-        | "--buffer-size"
-        | "--http-chunk-size"
-        | "--throttled-rate"
-        | "--external-downloader"
-        | "--downloader"
-        | "--external-downloader-args"
-        | "--downloader-args"
-        | "--batch-file"
-        | "--paths"
-        | "--output"
-        | "--output-na-placeholder"
-        | "--trim-filenames"
-        | "--load-info-json"
-        | "--cookies"
-        | "--cookies-from-browser"
-        | "--cache-dir"
-        | "--encoding"
-        | "--print"
-        | "--progress-template"
-        | "--progress-delta"
-        | "--user-agent"
-        | "--referer"
-        | "--add-headers"
-        | "--add-header"
-        | "--sleep-requests"
-        | "--sleep-interval"
-        | "--max-sleep-interval"
-        | "--sleep-subtitles"
-        | "--format"
-        | "--format-sort"
-        | "--merge-output-format"
-        | "--sub-format"
-        | "--sub-langs"
-        | "--sub-lang"
-        | "--username"
-        | "--password"
-        | "--twofactor"
-        | "--netrc-location"
-        | "--netrc-cmd"
-        | "--video-password"
-        | "--ap-mso"
-        | "--ap-username"
-        | "--ap-password"
-        | "--client-certificate"
-        | "--client-certificate-key"
-        | "--client-certificate-password"
-        | "--audio-format"
-        | "--audio-quality"
-        | "--remux-video"
-        | "--recode-video"
-        | "--postprocessor-args"
-        | "--ppa"
-        | "--convert-thumbnails"
-        | "--convert-subs"
-        | "--convert-subtitles"
-        | "--exec"
-        | "--concat-playlist"
-        | "--sponsorblock-mark"
-        | "--sponsorblock-remove"
-        | "--sponsorblock-chapter-title"
-        | "--sponsorblock-api"
-        | "--ffmpeg-location"
-        | "--fixup"
-        | "--use-postprocessor"
-        | "--wait-for-video"
-        | "--extractor-args"
-        | "--preset-alias" => 1,
-        _ => 0,
+/// Strict allowlist of canonical `yt-dlp` long options for `--upload <ID>`.
+///
+/// Excludes `--alias`, `--batch-file`, `--config-locations`, `--config-location`,
+/// `--load-info-json`, all `optparse` prefix abbreviations, and all unknown options.
+fn allowed_long_option_arity(flag_name: &str) -> Option<usize> {
+    match flag_name {
+        "help"
+        | "version"
+        | "update"
+        | "no-update"
+        | "ignore-errors"
+        | "no-ignore-errors"
+        | "abort-on-error"
+        | "no-abort-on-error"
+        | "dump-user-agent"
+        | "list-extractors"
+        | "extractor-descriptions"
+        | "ignore-config"
+        | "no-config"
+        | "flat-playlist"
+        | "no-flat-playlist"
+        | "live-from-start"
+        | "no-live-from-start"
+        | "mark-watched"
+        | "no-mark-watched"
+        | "no-colors"
+        | "quiet"
+        | "no-quiet"
+        | "no-warnings"
+        | "simulate"
+        | "no-simulate"
+        | "ignore-no-formats-error"
+        | "no-ignore-no-formats-error"
+        | "skip-download"
+        | "no-download"
+        | "no-skip-download"
+        | "dump-json"
+        | "dump-single-json"
+        | "force-write-archive"
+        | "newline"
+        | "no-progress"
+        | "progress"
+        | "console-title"
+        | "verbose"
+        | "dump-pages"
+        | "write-pages"
+        | "print-traffic"
+        | "call-home"
+        | "no-call-home"
+        | "get-url"
+        | "get-title"
+        | "get-id"
+        | "get-thumbnail"
+        | "get-description"
+        | "get-duration"
+        | "get-filename"
+        | "get-format"
+        | "list-formats"
+        | "list-subs"
+        | "list-thumbnails"
+        | "force-ipv4"
+        | "force-ipv6"
+        | "geo-bypass"
+        | "no-geo-bypass"
+        | "no-check-certificates"
+        | "no-check-certificate"
+        | "prefer-insecure"
+        | "legacy-server-connect"
+        | "bidi-workaround"
+        | "yes-playlist"
+        | "no-playlist"
+        | "no-match-filters"
+        | "no-break-match-filters"
+        | "no-download-archive"
+        | "include-ads"
+        | "no-include-ads"
+        | "break-on-existing"
+        | "no-break-on-existing"
+        | "break-on-reject"
+        | "no-break-on-reject"
+        | "break-per-input"
+        | "no-break-per-input"
+        | "lazy-playlist"
+        | "no-lazy-playlist"
+        | "playlist-random"
+        | "playlist-reverse"
+        | "no-playlist-reverse"
+        | "skip-unavailable-fragments"
+        | "abort-on-unavailable-fragments"
+        | "no-abort-on-unavailable-fragments"
+        | "keep-fragments"
+        | "no-keep-fragments"
+        | "no-resize-buffer"
+        | "hls-use-mpegts"
+        | "no-hls-use-mpegts"
+        | "hls-prefer-native"
+        | "hls-prefer-ffmpeg"
+        | "restrict-filenames"
+        | "no-restrict-filenames"
+        | "windows-filenames"
+        | "no-windows-filenames"
+        | "no-overwrites"
+        | "force-overwrites"
+        | "no-force-overwrites"
+        | "continue"
+        | "no-continue"
+        | "part"
+        | "no-part"
+        | "mtime"
+        | "no-mtime"
+        | "write-description"
+        | "no-write-description"
+        | "write-info-json"
+        | "no-write-info-json"
+        | "write-playlist-metafiles"
+        | "no-write-playlist-metafiles"
+        | "clean-info-json"
+        | "no-clean-info-json"
+        | "write-comments"
+        | "no-write-comments"
+        | "no-cookies"
+        | "no-cookies-from-browser"
+        | "no-cache-dir"
+        | "rm-cache-dir"
+        | "write-thumbnail"
+        | "no-write-thumbnail"
+        | "write-all-thumbnails"
+        | "write-link"
+        | "write-url-shortcut"
+        | "write-webloc-shortcut"
+        | "write-desktop-link"
+        | "xattr-set-filesize"
+        | "format-sort-force"
+        | "no-format-sort-force"
+        | "video-multistreams"
+        | "no-video-multistreams"
+        | "audio-multistreams"
+        | "no-audio-multistreams"
+        | "all-formats"
+        | "no-all-formats"
+        | "prefer-free-formats"
+        | "no-prefer-free-formats"
+        | "check-formats"
+        | "check-all-formats"
+        | "no-check-formats"
+        | "allow-unplayable-formats"
+        | "no-allow-unplayable-formats"
+        | "write-subs"
+        | "no-write-subs"
+        | "write-sub"
+        | "no-write-sub"
+        | "write-auto-subs"
+        | "no-write-auto-subs"
+        | "write-auto-sub"
+        | "no-write-auto-sub"
+        | "all-subs"
+        | "netrc"
+        | "no-netrc"
+        | "ap-list-mso"
+        | "extract-audio"
+        | "keep-video"
+        | "no-keep-video"
+        | "post-overwrites"
+        | "no-post-overwrites"
+        | "embed-subs"
+        | "no-embed-subs"
+        | "embed-thumbnail"
+        | "no-embed-thumbnail"
+        | "embed-metadata"
+        | "no-embed-metadata"
+        | "add-metadata"
+        | "embed-chapters"
+        | "no-embed-chapters"
+        | "embed-info-json"
+        | "no-embed-info-json"
+        | "xattrs"
+        | "no-exec"
+        | "split-chapters"
+        | "no-split-chapters"
+        | "no-remove-chapters"
+        | "force-keyframes-at-cuts"
+        | "no-force-keyframes-at-cuts"
+        | "no-sponsorblock"
+        | "chapters-from-comments"
+        | "no-chapters-from-comments" => Some(0),
+        "update-to"
+        | "use-extractors"
+        | "plugin-dirs"
+        | "js-runtimes"
+        | "remote-components"
+        | "wait-for-video"
+        | "color"
+        | "compat-options"
+        | "preset-alias"
+        | "print"
+        | "progress-template"
+        | "progress-delta"
+        | "encoding"
+        | "proxy"
+        | "socket-timeout"
+        | "source-address"
+        | "impersonate"
+        | "geo-verification-proxy"
+        | "xff"
+        | "user-agent"
+        | "referer"
+        | "add-headers"
+        | "add-header"
+        | "sleep-requests"
+        | "sleep-interval"
+        | "max-sleep-interval"
+        | "sleep-subtitles"
+        | "extractor-args"
+        | "playlist-items"
+        | "playlist-start"
+        | "playlist-end"
+        | "min-filesize"
+        | "max-filesize"
+        | "date"
+        | "datebefore"
+        | "dateafter"
+        | "match-filters"
+        | "match-filter"
+        | "break-match-filters"
+        | "age-limit"
+        | "download-archive"
+        | "max-downloads"
+        | "skip-playlist-after-errors"
+        | "match-title"
+        | "reject-title"
+        | "min-views"
+        | "max-views"
+        | "concurrent-fragments"
+        | "limit-rate"
+        | "throttled-rate"
+        | "retries"
+        | "file-access-retries"
+        | "fragment-retries"
+        | "extractor-retries"
+        | "retry-sleep"
+        | "buffer-size"
+        | "http-chunk-size"
+        | "external-downloader"
+        | "downloader"
+        | "external-downloader-args"
+        | "downloader-args"
+        | "download-sections"
+        | "paths"
+        | "output"
+        | "output-na-placeholder"
+        | "trim-filenames"
+        | "cookies"
+        | "cookies-from-browser"
+        | "cache-dir"
+        | "format"
+        | "format-sort"
+        | "merge-output-format"
+        | "sub-format"
+        | "sub-langs"
+        | "sub-lang"
+        | "username"
+        | "password"
+        | "twofactor"
+        | "netrc-location"
+        | "netrc-cmd"
+        | "video-password"
+        | "ap-mso"
+        | "ap-username"
+        | "ap-password"
+        | "client-certificate"
+        | "client-certificate-key"
+        | "client-certificate-password"
+        | "audio-format"
+        | "audio-quality"
+        | "remux-video"
+        | "recode-video"
+        | "postprocessor-args"
+        | "ppa"
+        | "concat-playlist"
+        | "fixup"
+        | "ffmpeg-location"
+        | "exec"
+        | "convert-subs"
+        | "convert-subtitles"
+        | "convert-thumbnails"
+        | "remove-chapters"
+        | "use-postprocessor"
+        | "sponsorblock-mark"
+        | "sponsorblock-remove"
+        | "sponsorblock-chapter-title"
+        | "sponsorblock-api" => Some(1),
+        "print-to-file" | "parse-metadata" => Some(2),
+        "replace-in-metadata" => Some(3),
+        _ => None,
     }
+}
+
+fn known_arity_for_passthrough_scan(flag_name: &str) -> usize {
+    match flag_name {
+        "batch-file" | "config-locations" | "config-location" | "load-info-json" => 1,
+        "alias" => 2,
+        other => allowed_long_option_arity(other).unwrap_or(0),
+    }
+}
+
+fn has_help_or_version(args: &[String]) -> bool {
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--help" || arg == "--version" || arg == "-h" {
+            return true;
+        }
+        if !arg.starts_with("--")
+            && arg.starts_with('-')
+            && arg != "-"
+            && let Some(ch) = arg[1..].chars().next()
+            && ch == 'h'
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,8 +1148,7 @@ impl InvocationMode {
                     _ => {}
                 }
                 if inline_value.is_none() {
-                    let full_flag = format!("--{flag_name}");
-                    i += 1 + long_option_arity(&full_flag);
+                    i += 1 + known_arity_for_passthrough_scan(flag_name);
                 } else {
                     i += 1;
                 }
@@ -875,7 +1176,7 @@ impl InvocationMode {
                         }
                         break;
                     }
-                    _ if short_option_takes_arg(ch) => {
+                    ch if allowed_short_option_arity(ch) == Some(1) || ch == 'a' => {
                         let has_inline = idx + ch.len_utf8() < shorts.len();
                         if !has_inline {
                             extra_consumed = 1;
@@ -913,8 +1214,8 @@ fn print_template_implies_simulate(template: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct OutputSearchSpec {
-    search_roots: Vec<PathBuf>,
+struct OutputPathHints {
+    explicit_dirs: Vec<PathBuf>,
     output_templates: Vec<OutputTemplateSpec>,
 }
 
@@ -925,7 +1226,7 @@ struct OutputTemplateSpec {
     literal_prefix: Option<String>,
 }
 
-impl OutputSearchSpec {
+impl OutputPathHints {
     fn from_args(args: &[String], working_dir: &Path) -> Self {
         let mut path_entries: Vec<(Option<String>, PathBuf)> = Vec::new();
         let mut raw_outputs: Vec<String> = Vec::new();
@@ -966,8 +1267,7 @@ impl OutputSearchSpec {
                     _ => {}
                 }
                 if inline_value.is_none() {
-                    let full_flag = format!("--{flag_name}");
-                    i += 1 + long_option_arity(&full_flag);
+                    i += 1 + known_arity_for_passthrough_scan(flag_name);
                 } else {
                     i += 1;
                 }
@@ -994,7 +1294,7 @@ impl OutputSearchSpec {
                     }
                     break;
                 }
-                if short_option_takes_arg(ch) {
+                if allowed_short_option_arity(ch) == Some(1) || ch == 'a' {
                     let has_inline = idx + ch.len_utf8() < shorts.len();
                     if !has_inline {
                         extra_consumed = 1;
@@ -1006,9 +1306,7 @@ impl OutputSearchSpec {
         }
 
         let mut home_dir: Option<PathBuf> = None;
-        let mut root_set = BTreeSet::new();
-        root_set.insert(working_dir.to_path_buf());
-
+        let mut explicit_dirs = Vec::new();
         for (kind, path) in &path_entries {
             if kind.as_deref() == Some("temp") {
                 continue;
@@ -1016,7 +1314,9 @@ impl OutputSearchSpec {
             if kind.is_none() || kind.as_deref() == Some("home") {
                 home_dir = Some(path.clone());
             }
-            root_set.insert(path.clone());
+            if !explicit_dirs.contains(path) {
+                explicit_dirs.push(path.clone());
+            }
         }
 
         let mut output_templates = Vec::new();
@@ -1025,16 +1325,17 @@ impl OutputSearchSpec {
                 continue;
             }
             let (kind, template) = split_yt_dlp_type_prefix(&raw);
-            if kind.as_deref() == Some("thumbnail")
-                || kind.as_deref() == Some("description")
-                || kind.as_deref() == Some("infojson")
-            {
+            if matches!(
+                kind.as_deref(),
+                Some("thumbnail" | "description" | "infojson")
+            ) {
                 continue;
             }
             if let Some(dir) =
                 extract_static_template_dir(template, home_dir.as_deref(), working_dir)
+                && !explicit_dirs.contains(&dir)
             {
-                root_set.insert(dir);
+                explicit_dirs.push(dir);
             }
             if let Some(spec) = OutputTemplateSpec::parse(template) {
                 output_templates.push(spec);
@@ -1042,7 +1343,7 @@ impl OutputSearchSpec {
         }
 
         Self {
-            search_roots: root_set.into_iter().collect(),
+            explicit_dirs,
             output_templates,
         }
     }
@@ -1124,117 +1425,57 @@ fn extract_static_template_dir(
     Some(resolved)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileSignature {
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-fn snapshot_roots(roots: &[PathBuf]) -> Result<HashMap<PathBuf, FileSignature>, DownloadError> {
-    let mut snapshot = HashMap::new();
-    for root in roots {
-        if !root.exists() {
-            continue;
-        }
-        collect_files_bounded(root, 0, 3, &mut snapshot).map_err(|err| {
-            DownloadError::Io(format!(
-                "failed to inspect download directory '{}': {err}",
-                root.display()
-            ))
-        })?;
-    }
-    Ok(snapshot)
-}
-
-fn collect_files_bounded(
-    dir: &Path,
-    depth: usize,
-    max_depth: usize,
-    out: &mut HashMap<PathBuf, FileSignature>,
-) -> std::io::Result<()> {
-    if depth > max_depth || !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if let Some(name) = path.file_name().and_then(OsStr::to_str)
-                && matches!(name, ".git" | "target" | "node_modules")
-            {
-                continue;
-            }
-            collect_files_bounded(&path, depth + 1, max_depth, out)?;
-        } else if file_type.is_file() {
-            let meta = entry.metadata()?;
-            out.insert(
-                path,
-                FileSignature {
-                    len: meta.len(),
-                    modified: meta.modified().ok(),
-                },
-            );
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct CandidateArtifact {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportedCandidate {
     path: PathBuf,
-    from_yt_dlp_output: bool,
+    reported_id: Option<String>,
 }
 
-fn confirm_artifacts(
+fn confirm_reported_artifacts(
     target: &DownloadTarget,
     mode: InvocationMode,
-    output_spec: &OutputSearchSpec,
+    path_hints: &OutputPathHints,
     working_dir: &Path,
-    pre: &HashMap<PathBuf, FileSignature>,
-    post: &HashMap<PathBuf, FileSignature>,
+    manifest_contents: &str,
     stdout: &str,
 ) -> Vec<PathBuf> {
-    let mut candidates: Vec<CandidateArtifact> = Vec::new();
+    let mut candidates: Vec<ReportedCandidate> = Vec::new();
 
-    for (path, sig) in post {
-        let changed_or_new = match pre.get(path) {
-            None => true,
-            Some(prev) => prev != sig,
-        };
-        if changed_or_new {
-            candidates.push(CandidateArtifact {
-                path: path.clone(),
-                from_yt_dlp_output: false,
-            });
+    for record in parse_manifest_records(manifest_contents) {
+        if let Some(resolved) =
+            resolve_reported_path(&record.path, working_dir, &path_hints.explicit_dirs)
+        {
+            merge_candidate(
+                &mut candidates,
+                ReportedCandidate {
+                    path: resolved,
+                    reported_id: record.id,
+                },
+            );
         }
     }
 
     for reported in parse_stdout_artifact_paths(stdout) {
         if let Some(resolved) =
-            resolve_reported_path(&reported, working_dir, &output_spec.search_roots)
+            resolve_reported_path(&reported, working_dir, &path_hints.explicit_dirs)
         {
-            if let Some(existing) = candidates
-                .iter_mut()
-                .find(|item| paths_equivalent(&item.path, &resolved))
-            {
-                existing.from_yt_dlp_output = true;
-            } else {
-                candidates.push(CandidateArtifact {
+            merge_candidate(
+                &mut candidates,
+                ReportedCandidate {
                     path: resolved,
-                    from_yt_dlp_output: true,
-                });
-            }
+                    reported_id: None,
+                },
+            );
         }
     }
 
     let mut confirmed: Vec<PathBuf> = Vec::new();
     for candidate in candidates {
-        if !is_valid_artifact_file(&candidate.path, mode, candidate.from_yt_dlp_output) {
+        if !is_valid_artifact_file(&candidate.path, mode) {
             continue;
         }
         if let DownloadTarget::PendingUpload { upload } = target
-            && !artifact_matches_upload(&candidate.path, upload, &output_spec.output_templates)
+            && !candidate_matches_upload(&candidate, upload, &path_hints.output_templates)
         {
             continue;
         }
@@ -1249,10 +1490,23 @@ fn confirm_artifacts(
     confirmed
 }
 
+fn merge_candidate(candidates: &mut Vec<ReportedCandidate>, incoming: ReportedCandidate) {
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|item| paths_equivalent(&item.path, &incoming.path))
+    {
+        if existing.reported_id.is_none() {
+            existing.reported_id = incoming.reported_id;
+        }
+    } else {
+        candidates.push(incoming);
+    }
+}
+
 fn resolve_reported_path(
     raw: &Path,
     working_dir: &Path,
-    search_roots: &[PathBuf],
+    explicit_dirs: &[PathBuf],
 ) -> Option<PathBuf> {
     if raw.as_os_str().is_empty() || raw == Path::new("-") {
         return None;
@@ -1264,8 +1518,8 @@ fn resolve_reported_path(
     if from_working.is_file() {
         return Some(from_working);
     }
-    for root in search_roots {
-        let candidate = root.join(raw);
+    for dir in explicit_dirs {
+        let candidate = dir.join(raw);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -1280,6 +1534,269 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestRecord {
+    id: Option<String>,
+    path: PathBuf,
+}
+
+fn parse_manifest_records(contents: &str) -> Vec<ManifestRecord> {
+    let mut records = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(JsonValue::Object(obj)) = parse_json(trimmed) else {
+            continue;
+        };
+        let id = match obj.get("id") {
+            Some(JsonValue::String(s)) if !s.is_empty() && s != "NA" => Some(s.clone()),
+            _ => None,
+        };
+        match obj.get("kind") {
+            Some(JsonValue::String(kind)) if kind == "media" => {
+                if let Some(JsonValue::String(path)) = obj.get("path")
+                    && !path.is_empty()
+                    && path != "NA"
+                    && path != "-"
+                {
+                    records.push(ManifestRecord {
+                        id,
+                        path: PathBuf::from(path),
+                    });
+                }
+            }
+            Some(JsonValue::String(kind)) if kind == "subtitles" => {
+                if let Some(JsonValue::Object(subs)) = obj.get("subtitles") {
+                    for val in subs.values() {
+                        if let JsonValue::String(path) = val
+                            && !path.is_empty()
+                            && path != "NA"
+                            && path != "-"
+                        {
+                            records.push(ManifestRecord {
+                                id: id.clone(),
+                                path: PathBuf::from(path),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    records
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number,
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(BTreeMap<String, JsonValue>),
+}
+
+fn parse_json(input: &str) -> Result<JsonValue, ()> {
+    let mut parser = JsonParser {
+        bytes: input.as_bytes(),
+        pos: 0,
+    };
+    let val = parser.parse_value()?;
+    parser.skip_ws();
+    if parser.pos == parser.bytes.len() {
+        Ok(val)
+    } else {
+        Err(())
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn parse_value(&mut self) -> Result<JsonValue, ()> {
+        self.skip_ws();
+        match self.peek().ok_or(())? {
+            b'{' => self.parse_object(),
+            b'[' => self.parse_array(),
+            b'"' => self.parse_string().map(JsonValue::String),
+            b'n' => {
+                self.expect_literal(b"null")?;
+                Ok(JsonValue::Null)
+            }
+            b't' => {
+                self.expect_literal(b"true")?;
+                Ok(JsonValue::Bool(true))
+            }
+            b'f' => {
+                self.expect_literal(b"false")?;
+                Ok(JsonValue::Bool(false))
+            }
+            b'-' | b'0'..=b'9' => {
+                self.consume_number();
+                Ok(JsonValue::Number)
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn expect_literal(&mut self, lit: &[u8]) -> Result<(), ()> {
+        if self.bytes[self.pos..].starts_with(lit) {
+            self.pos += lit.len();
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn consume_number(&mut self) {
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if matches!(b, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<JsonValue, ()> {
+        self.pos += 1; // '['
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(JsonValue::Array(items));
+        }
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.peek().ok_or(())? {
+                b',' => self.pos += 1,
+                b']' => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Array(items));
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<JsonValue, ()> {
+        self.pos += 1; // '{'
+        let mut map = BTreeMap::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(JsonValue::Object(map));
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(());
+            }
+            self.pos += 1;
+            let value = self.parse_value()?;
+            map.insert(key, value);
+            self.skip_ws();
+            match self.peek().ok_or(())? {
+                b',' => self.pos += 1,
+                b'}' => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Object(map));
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, ()> {
+        if self.peek() != Some(b'"') {
+            return Err(());
+        }
+        self.pos += 1;
+        let mut out = String::new();
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                self.pos += 1;
+                return Ok(out);
+            }
+            if b == b'\\' {
+                self.pos += 1;
+                let esc = *self.bytes.get(self.pos).ok_or(())?;
+                self.pos += 1;
+                match esc {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000c}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let code = self.parse_hex4()?;
+                        if (0xD800..=0xDBFF).contains(&code) {
+                            // UTF-16 surrogate pair
+                            if self.bytes[self.pos..].starts_with(b"\\u") {
+                                self.pos += 2;
+                                let low = self.parse_hex4()?;
+                                if (0xDC00..=0xDFFF).contains(&low) {
+                                    let combined = 0x10000
+                                        + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
+                                    let ch = char::from_u32(combined).ok_or(())?;
+                                    out.push(ch);
+                                } else {
+                                    return Err(());
+                                }
+                            } else {
+                                return Err(());
+                            }
+                        } else {
+                            let ch = char::from_u32(code as u32).ok_or(())?;
+                            out.push(ch);
+                        }
+                    }
+                    _ => return Err(()),
+                }
+                continue;
+            }
+            let s = std::str::from_utf8(&self.bytes[self.pos..]).map_err(|_| ())?;
+            let ch = s.chars().next().ok_or(())?;
+            out.push(ch);
+            self.pos += ch.len_utf8();
+        }
+        Err(())
+    }
+
+    fn parse_hex4(&mut self) -> Result<u16, ()> {
+        if self.pos + 4 > self.bytes.len() {
+            return Err(());
+        }
+        let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4]).map_err(|_| ())?;
+        self.pos += 4;
+        u16::from_str_radix(hex, 16).map_err(|_| ())
     }
 }
 
@@ -1361,7 +1878,7 @@ fn unquote_yt_dlp_path(raw: &str) -> &str {
     }
 }
 
-fn is_valid_artifact_file(path: &Path, mode: InvocationMode, from_yt_dlp_output: bool) -> bool {
+fn is_valid_artifact_file(path: &Path, mode: InvocationMode) -> bool {
     let Ok(meta) = fs::metadata(path) else {
         return false;
     };
@@ -1395,19 +1912,22 @@ fn is_valid_artifact_file(path: &Path, mode: InvocationMode, from_yt_dlp_output:
         InvocationMode::SimulatedOrNoDownload => false,
         InvocationMode::SubtitleOnly => SUBTITLE_EXTENSIONS.contains(&ext.as_str()),
         InvocationMode::DownloadMediaOrSubs => {
-            MEDIA_EXTENSIONS.contains(&ext.as_str())
-                || SUBTITLE_EXTENSIONS.contains(&ext.as_str())
-                || from_yt_dlp_output
+            MEDIA_EXTENSIONS.contains(&ext.as_str()) || SUBTITLE_EXTENSIONS.contains(&ext.as_str())
         }
     }
 }
 
-fn artifact_matches_upload(
-    path: &Path,
+fn candidate_matches_upload(
+    candidate: &ReportedCandidate,
     upload: &Upload,
     output_templates: &[OutputTemplateSpec],
 ) -> bool {
-    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+    if let Some(reported_id) = &candidate.reported_id {
+        return id_matches_upload(reported_id, &upload.platform_upload_id);
+    }
+
+    // Fallback for stdout-only reports when `--print-to-file` manifest records are absent.
+    let Some(file_name) = candidate.path.file_name().and_then(OsStr::to_str) else {
         return false;
     };
 
@@ -1418,8 +1938,6 @@ fn artifact_matches_upload(
         return true;
     }
 
-    // If a custom `-o` template explicitly omits `%(id)s`, allow matching against the user's
-    // template prefix or upload title as long as the filename doesn't carry a different ID tag.
     let custom_without_id = output_templates.iter().any(|tpl| !tpl.uses_id);
     if !custom_without_id {
         return false;
@@ -1451,6 +1969,24 @@ fn artifact_matches_upload(
         }
     }
 
+    false
+}
+
+fn id_matches_upload(reported_id: &str, expected_id: &str) -> bool {
+    if reported_id == expected_id {
+        return true;
+    }
+    let sanitized = sanitize_yt_dlp_component(expected_id);
+    if reported_id == sanitized {
+        return true;
+    }
+    // Single-part Bilibili uploads may carry `_p1` suffix in yt-dlp metadata.
+    if let Some(rest) = reported_id
+        .strip_prefix(expected_id)
+        .or_else(|| reported_id.strip_prefix(&sanitized))
+    {
+        return rest.starts_with("_p") && rest[2..].bytes().all(|b| b.is_ascii_digit());
+    }
     false
 }
 
@@ -1543,7 +2079,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_upload_validation_rejects_multi_target_and_target_displacement() {
+    fn pending_upload_validation_rejects_aliases_abbreviations_unknowns_and_multi_target() {
         let cases = [
             pending_request(vec![], vec!["--", "https://other.example/video"]),
             pending_request(vec!["--"], vec![]),
@@ -1554,9 +2090,20 @@ mod tests {
             pending_request(vec![], vec!["-qa", "urls.txt"]),
             pending_request(vec![], vec!["--batch-file", "urls.txt"]),
             pending_request(vec![], vec!["--batch-file=urls.txt"]),
+            pending_request(vec![], vec!["--batch", "urls.txt"]),
+            pending_request(vec![], vec!["--batch=urls.txt"]),
             pending_request(vec!["--config-locations", "custom.conf"], vec![]),
             pending_request(vec![], vec!["--config-location=custom.conf"]),
+            pending_request(vec![], vec!["--config=custom.conf"]),
+            pending_request(vec![], vec!["--config-loc", "custom.conf"]),
             pending_request(vec![], vec!["--load-info-json", "other.info.json"]),
+            pending_request(vec![], vec!["--load-info=other.info.json"]),
+            pending_request(vec![], vec!["--alias", "--x", "--batch-file urls.txt"]),
+            pending_request(vec![], vec!["--ali", "--x", "https://other.example"]),
+            pending_request(vec![], vec!["--unknown-flag"]),
+            pending_request(vec![], vec!["--unknown-flag=value"]),
+            pending_request(vec![], vec!["--simulate=yes"]),
+            pending_request(vec![], vec!["-z"]),
             pending_request(vec!["-f"], vec!["best"]),
             pending_request(vec![], vec!["--output"]),
         ];
@@ -1639,6 +2186,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_manifest_records_with_escaped_json_and_subtitles() {
+        let manifest = r#"
+{"kind":"media","id":"BV1xx411c7mD","path":"/tmp/My \"Video\" [BV1xx411c7mD].mp4"}
+{"kind":"subtitles","id":"BV1xx411c7mD","subtitles":{"en":"/tmp/sub.en.vtt","zh-Hans":"/tmp/sub.zh.srt"}}
+{"kind":"media","id":"BV1xx411c7mD","path":null}
+{"kind":"subtitles","id":"BV1xx411c7mD","subtitles":null}
+"#;
+        let records = parse_manifest_records(manifest);
+        assert_eq!(
+            records,
+            vec![
+                ManifestRecord {
+                    id: Some("BV1xx411c7mD".to_owned()),
+                    path: PathBuf::from(r#"/tmp/My "Video" [BV1xx411c7mD].mp4"#),
+                },
+                ManifestRecord {
+                    id: Some("BV1xx411c7mD".to_owned()),
+                    path: PathBuf::from("/tmp/sub.en.vtt"),
+                },
+                ManifestRecord {
+                    id: Some("BV1xx411c7mD".to_owned()),
+                    path: PathBuf::from("/tmp/sub.zh.srt"),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn parses_yt_dlp_stdout_artifact_lines() {
         let stdout = "\
 [download] Destination: Video [BV1xx].f137.mp4
@@ -1663,40 +2238,48 @@ mod tests {
     }
 
     #[test]
-    fn artifact_matching_checks_upload_id_and_custom_templates() {
+    fn candidate_matching_checks_manifest_id_and_stdout_fallback() {
         let upload = sample_upload();
 
-        assert!(artifact_matches_upload(
-            Path::new("Sample Upload [BV1xx411c7mD].mp4"),
+        assert!(candidate_matches_upload(
+            &ReportedCandidate {
+                path: PathBuf::from("arbitrary_custom_name.mp4"),
+                reported_id: Some("BV1xx411c7mD".to_owned()),
+            },
             &upload,
             &[],
         ));
-        assert!(artifact_matches_upload(
-            Path::new("Sample Upload [BV1xx411c7mD].en.srt"),
+        assert!(candidate_matches_upload(
+            &ReportedCandidate {
+                path: PathBuf::from("arbitrary_custom_name.mp4"),
+                reported_id: Some("BV1xx411c7mD_p1".to_owned()),
+            },
             &upload,
             &[],
         ));
-        assert!(!artifact_matches_upload(
-            Path::new("Other Video [BV9999999999].mp4"),
+        assert!(!candidate_matches_upload(
+            &ReportedCandidate {
+                path: PathBuf::from("Sample Upload [BV1xx411c7mD].mp4"),
+                reported_id: Some("BV999other".to_owned()),
+            },
             &upload,
             &[],
         ));
-        assert!(!artifact_matches_upload(
-            Path::new("unrelated.mp4"),
+        assert!(candidate_matches_upload(
+            &ReportedCandidate {
+                path: PathBuf::from("Sample Upload [BV1xx411c7mD].en.srt"),
+                reported_id: None,
+            },
             &upload,
             &[],
         ));
-
-        let custom_tpl = vec![OutputTemplateSpec::parse("custom_clip.%(ext)s").unwrap()];
-        assert!(artifact_matches_upload(
-            Path::new("custom_clip.mp4"),
+        assert!(!candidate_matches_upload(
+            &ReportedCandidate {
+                path: PathBuf::from("unrelated.mp4"),
+                reported_id: None,
+            },
             &upload,
-            &custom_tpl,
-        ));
-        assert!(!artifact_matches_upload(
-            Path::new("custom_clip [BVother].mp4"),
-            &upload,
-            &custom_tpl,
+            &[],
         ));
     }
 }

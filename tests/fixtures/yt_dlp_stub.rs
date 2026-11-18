@@ -23,9 +23,13 @@ const KNOWN_LONG_OPTIONS: &[(&str, &str, usize)] = &[
     ("extract-audio", "extract-audio", 0),
     ("format", "format", 1),
     ("get-filename", "get-filename", 0),
+    ("get-title", "get-title", 0),
     ("get-url", "get-url", 0),
     ("help", "help", 0),
     ("ignore-config", "ignore-config", 0),
+    ("list-formats", "list-formats", 0),
+    ("list-subs", "list-subs", 0),
+    ("list-thumbnails", "list-thumbnails", 0),
     ("load-info-json", "load-info-json", 1),
     ("no-overwrites", "no-overwrites", 0),
     ("no-playlist", "no-playlist", 0),
@@ -104,6 +108,7 @@ fn load_stub_settings() -> HashMap<String, String> {
         "SIPHON_STUB_UPLOAD_ID",
         "SIPHON_STUB_TITLE",
         "SIPHON_STUB_CREATE_PART",
+        "SIPHON_STUB_STDERR_PROGRESS",
     ] {
         if let Ok(val) = env::var(key) {
             map.insert(key.to_owned(), val);
@@ -162,6 +167,9 @@ struct ParsedArgs {
     config_locations: Vec<PathBuf>,
     load_info_json: Option<PathBuf>,
     print_to_files: Vec<PrintToFileRule>,
+    print_exprs: Vec<(String, String)>,
+    dump_json: bool,
+    list_formats: bool,
     aliases: HashMap<String, Vec<String>>,
     help_or_version: bool,
 }
@@ -251,7 +259,18 @@ fn parse_token_stream(tokens: &[String], parsed: &mut ParsedArgs) -> Result<(), 
                 "yes-playlist" => parsed.yes_playlist = true,
                 "simulate" => parsed.simulate = Some(true),
                 "no-simulate" => parsed.simulate = Some(false),
-                "dump-json" | "dump-single-json" | "get-url" | "get-filename" => {
+                "dump-json" | "dump-single-json" => {
+                    parsed.implicit_simulate = true;
+                    parsed.dump_json = true;
+                }
+                "get-url" | "get-title" | "get-filename" => {
+                    parsed.implicit_simulate = true;
+                }
+                "list-formats" => {
+                    parsed.implicit_simulate = true;
+                    parsed.list_formats = true;
+                }
+                "list-subs" | "list-thumbnails" => {
                     parsed.implicit_simulate = true;
                 }
                 "skip-download" => parsed.skip_download = true,
@@ -285,12 +304,33 @@ fn parse_token_stream(tokens: &[String], parsed: &mut ParsedArgs) -> Result<(), 
                 }
                 "print" => {
                     let v = get_arg(0)?;
-                    if !v.starts_with("after_move:")
-                        && !v.starts_with("post_process:")
-                        && !v.starts_with("after_video:")
-                    {
+                    let (when, expr) = match v.split_once(':') {
+                        Some((w, t))
+                            if matches!(
+                                w,
+                                "pre_process"
+                                    | "after_filter"
+                                    | "video"
+                                    | "before_dl"
+                                    | "post_dl"
+                                    | "post_process"
+                                    | "after_move"
+                                    | "after_video"
+                                    | "playlist"
+                            ) =>
+                        {
+                            (w.to_owned(), t.to_owned())
+                        }
+                        _ => ("video".to_owned(), v),
+                    };
+                    if !matches!(
+                        when.as_str(),
+                        "after_move" | "post_process" | "after_video" | "post_dl"
+                    ) {
                         parsed.implicit_simulate = true;
                     }
+                    parsed.quiet = true;
+                    parsed.print_exprs.push((when, expr));
                 }
                 "print-to-file" => {
                     let raw_tpl = get_arg(0)?;
@@ -346,7 +386,15 @@ fn parse_token_stream(tokens: &[String], parsed: &mut ParsedArgs) -> Result<(), 
             match ch {
                 'h' => parsed.help_or_version = true,
                 's' => parsed.simulate = Some(true),
-                'j' | 'J' | 'g' => parsed.implicit_simulate = true,
+                'j' | 'J' => {
+                    parsed.implicit_simulate = true;
+                    parsed.dump_json = true;
+                }
+                'F' => {
+                    parsed.implicit_simulate = true;
+                    parsed.list_formats = true;
+                }
+                'g' | 'e' => parsed.implicit_simulate = true,
                 'q' => parsed.quiet = true,
                 'w' => parsed.no_overwrites = true,
                 'x' => parsed.extract_audio = true,
@@ -443,6 +491,25 @@ fn write_artifact(path: &Path, content: &[u8]) {
         fs::create_dir_all(parent).expect("create parent dirs");
     }
     fs::write(path, content).expect("write stub artifact");
+}
+
+fn render_print_expr(expr: &str, title: &str, id: &str, filepath: Option<&Path>) -> String {
+    match expr {
+        "title" | "%(title)s" => title.to_owned(),
+        "id" | "%(id)s" => id.to_owned(),
+        "filepath" | "%(filepath)s" => filepath
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "NA".to_owned()),
+        other => other
+            .replace(
+                "%(filepath)s",
+                &filepath
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "NA".to_owned()),
+            )
+            .replace("%(title)s", title)
+            .replace("%(id)s", id),
+    }
 }
 
 fn emit_print_to_file(
@@ -592,12 +659,35 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    if let Some(stderr_progress) = settings
+        .get("SIPHON_STUB_STDERR_PROGRESS")
+        .filter(|s| !s.is_empty())
+    {
+        eprintln!("{stderr_progress}");
+    }
+
     let simulated = parsed.simulate == Some(true)
         || (parsed.implicit_simulate && parsed.simulate != Some(false));
     if simulated {
-        if !parsed.quiet {
-            for url in &parsed.urls {
-                let id = resolve_id_from_url(&settings, url);
+        for url in &parsed.urls {
+            let id = resolve_id_from_url(&settings, url);
+            if parsed.dump_json {
+                println!(
+                    "{{\"id\":{},\"title\":{},\"webpage_url\":{}}}",
+                    json_escape(&id),
+                    json_escape(&title),
+                    json_escape(url)
+                );
+            } else if parsed.list_formats {
+                println!("[info] Available formats for {id}:");
+                println!("ID  EXT RESOLUTION | PROTO");
+                println!("18  mp4 640x360    | https");
+            } else if !parsed.print_exprs.is_empty() {
+                for (_, expr) in &parsed.print_exprs {
+                    let rendered = render_print_expr(expr, &title, &id, None);
+                    println!("{rendered}");
+                }
+            } else if !parsed.quiet {
                 println!("[info] {id}: Simulating download for {url}");
             }
         }
@@ -703,6 +793,18 @@ fn main() -> ExitCode {
             }
             emit_print_to_file(&parsed, "after_move", &item_id, Some(&out_path), &[]);
             emit_print_to_file(&parsed, "after_video", &item_id, Some(&out_path), &[]);
+            for (_, expr) in &parsed.print_exprs {
+                let rendered = render_print_expr(expr, &item_title, &item_id, Some(&out_path));
+                println!("{rendered}");
+            }
+            if parsed.dump_json {
+                println!(
+                    "{{\"id\":{},\"title\":{},\"filepath\":{}}}",
+                    json_escape(&item_id),
+                    json_escape(&item_title),
+                    json_escape(&out_path.to_string_lossy())
+                );
+            }
         }
     }
 

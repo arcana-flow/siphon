@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 
 use crate::domain::{CookieSource, PresetName, Upload, UploadId, UploadStatus};
 use crate::error::{AppError, DownloadError, StorageError};
@@ -214,6 +215,75 @@ impl DownloadRequest {
             validate_single_target_slice(&self.extra_args, "command-line")?;
         }
         Ok(())
+    }
+
+    /// Returns `true` when forwarded `yt-dlp` options request machine-readable, listing, help,
+    /// or streamed output on stdout so Siphon must not append a summary line to stdout.
+    #[must_use]
+    pub fn preserves_passthrough_stdout(&self) -> bool {
+        let forwarded = self.forward_args();
+        let mut i = 0usize;
+        while i < forwarded.len() {
+            let arg = &forwarded[i];
+            if arg == "--" {
+                break;
+            }
+            if !arg.starts_with('-') || arg == "-" {
+                i += 1;
+                continue;
+            }
+            if let Some(rest) = arg.strip_prefix("--") {
+                let (flag_name, inline_value) = match rest.split_once('=') {
+                    Some((name, val)) => (name, Some(val)),
+                    None => (rest, None),
+                };
+                if is_passthrough_stdout_long_flag(flag_name) {
+                    return true;
+                }
+                if is_output_long_flag(flag_name) {
+                    let target = inline_value.or_else(|| forwarded.get(i + 1).map(String::as_str));
+                    if target == Some("-") {
+                        return true;
+                    }
+                }
+                if inline_value.is_none() {
+                    i += 1 + known_arity_for_passthrough_scan(flag_name);
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            let shorts = &arg[1..];
+            let mut extra_consumed = 0usize;
+            for (idx, ch) in shorts.char_indices() {
+                if matches!(ch, 'h' | 'j' | 'J' | 'O' | 'g' | 'e' | 'F') {
+                    return true;
+                }
+                if ch == 'o' {
+                    let inline = &shorts[idx + ch.len_utf8()..];
+                    let val = if inline.is_empty() {
+                        extra_consumed = 1;
+                        forwarded.get(i + 1).map(String::as_str)
+                    } else {
+                        Some(inline)
+                    };
+                    if val == Some("-") {
+                        return true;
+                    }
+                    break;
+                }
+                if allowed_short_option_arity(ch) == Some(1) || ch == 'a' {
+                    let has_inline = idx + ch.len_utf8() < shorts.len();
+                    if !has_inline {
+                        extra_consumed = 1;
+                    }
+                    break;
+                }
+            }
+            i += 1 + extra_consumed;
+        }
+        false
     }
 }
 
@@ -446,7 +516,7 @@ impl Downloader for YtDlpDownloader {
         let effective_working_dir = self.resolve_effective_working_dir()?;
         let forwarded = request.forward_args();
         let mode = InvocationMode::from_args(&forwarded);
-        let attach_manifest = !has_help_or_version(&forwarded);
+        let attach_manifest = !has_info_only_exit_flag(&forwarded);
 
         let manifest_guard = if attach_manifest {
             Some(TempManifestFile::create()?)
@@ -457,14 +527,24 @@ impl Downloader for YtDlpDownloader {
         let argv =
             self.build_child_argv(request, manifest_guard.as_ref().map(TempManifestFile::path))?;
 
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+
         // Pass each argument directly without invoking a shell.
         let mut command = Command::new(&self.binary);
         command.args(&argv);
         if let Some(dir) = &self.working_dir {
             command.current_dir(dir);
         }
+        command.stdin(Stdio::inherit());
+        if request.target.is_pending_upload() {
+            command.stdout(Stdio::piped());
+        } else {
+            command.stdout(Stdio::inherit());
+        }
+        command.stderr(Stdio::piped());
 
-        let output = command.output().map_err(|err| {
+        let mut child = command.spawn().map_err(|err| {
             if is_binary_unavailable_error(&err) {
                 DownloadError::DownloaderUnavailable {
                     binary: self.binary.to_string_lossy().into_owned(),
@@ -475,16 +555,40 @@ impl Downloader for YtDlpDownloader {
             }
         })?;
 
-        if !output.status.success() {
-            let stderr_text = String::from_utf8_lossy(&output.stderr);
-            let stdout_text = String::from_utf8_lossy(&output.stdout);
-            let detail = if stderr_text.trim().is_empty() {
-                stdout_text.trim().to_owned()
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
+
+        let (status, stdout_attribution_paths, stdout_fallback_err, stderr_captured) =
+            thread::scope(|scope| {
+                let stdout_handle = child_stdout
+                    .map(|reader| scope.spawn(move || stream_stdout_with_attribution(reader)));
+                let stderr_handle = child_stderr
+                    .map(|reader| scope.spawn(move || stream_and_capture_stderr(reader)));
+
+                let status_res = child.wait();
+                let (attr_paths, last_stdout_err) = match stdout_handle {
+                    Some(handle) => handle.join().unwrap_or_default(),
+                    None => (Vec::new(), String::new()),
+                };
+                let captured_stderr = match stderr_handle {
+                    Some(handle) => handle.join().unwrap_or_default(),
+                    None => String::new(),
+                };
+                (status_res, attr_paths, last_stdout_err, captured_stderr)
+            });
+
+        let status = status.map_err(|err| {
+            DownloadError::Io(format!("failed to wait for downloader process: {err}"))
+        })?;
+
+        if !status.success() {
+            let detail = if stderr_captured.trim().is_empty() {
+                stdout_fallback_err.trim().to_owned()
             } else {
-                stderr_text.trim().to_owned()
+                stderr_captured.trim().to_owned()
             };
             return Err(DownloadError::ProcessFailed {
-                exit_code: output.status.code(),
+                exit_code: status.code(),
                 stderr: detail,
             });
         }
@@ -506,7 +610,6 @@ impl Downloader for YtDlpDownloader {
             None => String::new(),
         };
 
-        let stdout_text = String::from_utf8_lossy(&output.stdout);
         let path_hints = OutputPathHints::from_args(&forwarded, &effective_working_dir);
         let confirmed_artifacts = confirm_reported_artifacts(
             &request.target,
@@ -514,7 +617,7 @@ impl Downloader for YtDlpDownloader {
             &path_hints,
             &effective_working_dir,
             &manifest_contents,
-            &stdout_text,
+            &stdout_attribution_paths,
         );
 
         Ok(DownloadOutcome {
@@ -1065,24 +1168,179 @@ fn known_arity_for_passthrough_scan(flag_name: &str) -> usize {
     }
 }
 
-fn has_help_or_version(args: &[String]) -> bool {
+fn is_passthrough_stdout_long_flag(flag_name: &str) -> bool {
+    const STDOUT_FLAGS: &[&str] = &[
+        "help",
+        "version",
+        "dump-json",
+        "dump-single-json",
+        "dump-user-agent",
+        "print",
+        "get-url",
+        "get-title",
+        "get-id",
+        "get-thumbnail",
+        "get-description",
+        "get-duration",
+        "get-filename",
+        "get-format",
+        "list-formats",
+        "list-subs",
+        "list-thumbnails",
+        "list-extractors",
+        "extractor-descriptions",
+    ];
+    if STDOUT_FLAGS.contains(&flag_name) {
+        return true;
+    }
+    // Also honor unambiguous optparse prefix abbreviations for passthrough stdout flags.
+    matches!(
+        flag_name,
+        "dump-j"
+            | "dump-js"
+            | "dump-jso"
+            | "dump-s"
+            | "dump-si"
+            | "dump-sin"
+            | "dump-sing"
+            | "dump-singl"
+            | "dump-single"
+            | "dump-single-"
+            | "dump-single-j"
+            | "dump-single-js"
+            | "dump-single-jso"
+            | "dump-u"
+            | "list-f"
+            | "list-fo"
+            | "list-for"
+            | "list-form"
+            | "list-forma"
+            | "list-format"
+            | "list-s"
+            | "list-su"
+            | "list-sub"
+            | "list-t"
+            | "list-th"
+            | "list-e"
+            | "list-ex"
+    )
+}
+
+fn is_output_long_flag(flag_name: &str) -> bool {
+    flag_name == "output" || flag_name == "outpu" || flag_name == "outp"
+}
+
+fn has_info_only_exit_flag(args: &[String]) -> bool {
     for arg in args {
         if arg == "--" {
             break;
         }
-        if arg == "--help" || arg == "--version" || arg == "-h" {
+        if matches!(
+            arg.as_str(),
+            "--help"
+                | "--version"
+                | "--dump-user-agent"
+                | "--list-extractors"
+                | "--extractor-descriptions"
+                | "-h"
+        ) {
             return true;
         }
-        if !arg.starts_with("--")
-            && arg.starts_with('-')
-            && arg != "-"
-            && let Some(ch) = arg[1..].chars().next()
-            && ch == 'h'
-        {
+        if !arg.starts_with("--") && arg.starts_with('-') && arg != "-" && arg[1..].contains('h') {
             return true;
         }
     }
     false
+}
+
+fn stream_stdout_with_attribution<R: Read>(mut reader: R) -> (Vec<PathBuf>, String) {
+    const MAX_ATTR_PATHS: usize = 1024;
+    const MAX_LINE_BYTES: usize = 8192;
+
+    let mut paths = Vec::new();
+    let mut last_non_empty = String::new();
+    let mut pending_line = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &buf[..n];
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(chunk);
+                let _ = stdout.flush();
+
+                for &byte in chunk {
+                    if byte == b'\n' || byte == b'\r' {
+                        process_streamed_stdout_line(
+                            &mut pending_line,
+                            &mut paths,
+                            &mut last_non_empty,
+                            MAX_ATTR_PATHS,
+                        );
+                    } else if pending_line.len() < MAX_LINE_BYTES {
+                        pending_line.push(byte);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !pending_line.is_empty() {
+        process_streamed_stdout_line(
+            &mut pending_line,
+            &mut paths,
+            &mut last_non_empty,
+            MAX_ATTR_PATHS,
+        );
+    }
+    (paths, last_non_empty)
+}
+
+fn process_streamed_stdout_line(
+    pending_line: &mut Vec<u8>,
+    paths: &mut Vec<PathBuf>,
+    last_non_empty: &mut String,
+    max_attr_paths: usize,
+) {
+    if pending_line.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(pending_line);
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        *last_non_empty = trimmed.to_owned();
+        if paths.len() < max_attr_paths
+            && let Some(path) = parse_stdout_artifact_line(trimmed)
+        {
+            paths.push(path);
+        }
+    }
+    pending_line.clear();
+}
+
+fn stream_and_capture_stderr<R: Read>(mut reader: R) -> String {
+    const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+    let mut captured = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &buf[..n];
+                let mut stderr = io::stderr().lock();
+                let _ = stderr.write_all(chunk);
+                let _ = stderr.flush();
+                if captured.len() < MAX_CAPTURE_BYTES {
+                    let remaining = MAX_CAPTURE_BYTES - captured.len();
+                    captured.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&captured).into_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1437,7 +1695,7 @@ fn confirm_reported_artifacts(
     path_hints: &OutputPathHints,
     working_dir: &Path,
     manifest_contents: &str,
-    stdout: &str,
+    stdout_paths: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut candidates: Vec<ReportedCandidate> = Vec::new();
 
@@ -1455,9 +1713,9 @@ fn confirm_reported_artifacts(
         }
     }
 
-    for reported in parse_stdout_artifact_paths(stdout) {
+    for reported in stdout_paths {
         if let Some(resolved) =
-            resolve_reported_path(&reported, working_dir, &path_hints.explicit_dirs)
+            resolve_reported_path(reported, working_dir, &path_hints.explicit_dirs)
         {
             merge_candidate(
                 &mut candidates,
@@ -1800,69 +2058,68 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn parse_stdout_artifact_paths(stdout: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for raw_line in stdout.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("[download] Destination: ") {
-            push_non_empty_path(&mut paths, rest);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[download] ")
-            && let Some(path_str) = rest.strip_suffix(" has already been downloaded")
-        {
-            push_non_empty_path(&mut paths, path_str);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
-            push_non_empty_path(&mut paths, unquote_yt_dlp_path(rest));
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
-            push_non_empty_path(&mut paths, rest);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[info] Writing video subtitles to: ") {
-            push_non_empty_path(&mut paths, rest);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[info] Writing subtitles to: ") {
-            push_non_empty_path(&mut paths, rest);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[MoveFiles] Moving file ")
-            && let Some((_, dest)) = rest.split_once(" to ")
-        {
-            push_non_empty_path(&mut paths, unquote_yt_dlp_path(dest));
-            continue;
-        }
-        if let Some(rest) = line
-            .strip_prefix("[VideoRemuxer] ")
-            .or_else(|| line.strip_prefix("[VideoConvertor] "))
-        {
-            if let Some(inner) = rest.strip_prefix("Not converting video file ") {
-                push_non_empty_path(&mut paths, unquote_yt_dlp_path(inner));
-            } else if let Some((_, dest)) = rest.split_once(" to ") {
-                push_non_empty_path(&mut paths, unquote_yt_dlp_path(dest));
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("[EmbedSubtitle] Embedding subtitles in ") {
-            push_non_empty_path(&mut paths, unquote_yt_dlp_path(rest));
-            continue;
-        }
+fn parse_stdout_artifact_line(raw_line: &str) -> Option<PathBuf> {
+    let line = raw_line.trim();
+    if line.is_empty() {
+        return None;
     }
-    paths
+
+    if let Some(rest) = line.strip_prefix("[download] Destination: ") {
+        return non_empty_path(rest);
+    }
+    if let Some(rest) = line.strip_prefix("[download] ")
+        && let Some(path_str) = rest.strip_suffix(" has already been downloaded")
+    {
+        return non_empty_path(path_str);
+    }
+    if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
+        return non_empty_path(unquote_yt_dlp_path(rest));
+    }
+    if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
+        return non_empty_path(rest);
+    }
+    if let Some(rest) = line.strip_prefix("[info] Writing video subtitles to: ") {
+        return non_empty_path(rest);
+    }
+    if let Some(rest) = line.strip_prefix("[info] Writing subtitles to: ") {
+        return non_empty_path(rest);
+    }
+    if let Some(rest) = line.strip_prefix("[MoveFiles] Moving file ")
+        && let Some((_, dest)) = rest.split_once(" to ")
+    {
+        return non_empty_path(unquote_yt_dlp_path(dest));
+    }
+    if let Some(rest) = line
+        .strip_prefix("[VideoRemuxer] ")
+        .or_else(|| line.strip_prefix("[VideoConvertor] "))
+    {
+        if let Some(inner) = rest.strip_prefix("Not converting video file ") {
+            return non_empty_path(unquote_yt_dlp_path(inner));
+        } else if let Some((_, dest)) = rest.split_once(" to ") {
+            return non_empty_path(unquote_yt_dlp_path(dest));
+        }
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix("[EmbedSubtitle] Embedding subtitles in ") {
+        return non_empty_path(unquote_yt_dlp_path(rest));
+    }
+    None
 }
 
-fn push_non_empty_path(out: &mut Vec<PathBuf>, raw: &str) {
+#[cfg(test)]
+fn parse_stdout_artifact_paths(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .filter_map(parse_stdout_artifact_line)
+        .collect()
+}
+
+fn non_empty_path(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if !trimmed.is_empty() && trimmed != "-" {
-        out.push(PathBuf::from(trimmed));
+        Some(PathBuf::from(trimmed))
+    } else {
+        None
     }
 }
 
@@ -2281,5 +2538,37 @@ mod tests {
             &upload,
             &[],
         ));
+    }
+
+    #[test]
+    fn detects_passthrough_stdout_flags_without_false_positives() {
+        let direct = |extra: &[&str]| DownloadRequest {
+            target: DownloadTarget::DirectUrl {
+                url: "https://www.bilibili.com/video/BV1test".to_owned(),
+            },
+            preset_name: None,
+            preset_args: Vec::new(),
+            extra_args: extra.iter().map(|s| (*s).to_owned()).collect(),
+            cookies: None,
+        };
+
+        assert!(direct(&["-J"]).preserves_passthrough_stdout());
+        assert!(direct(&["--dump-json"]).preserves_passthrough_stdout());
+        assert!(direct(&["--dump-single"]).preserves_passthrough_stdout());
+        assert!(direct(&["--print", "title"]).preserves_passthrough_stdout());
+        assert!(direct(&["--print=id"]).preserves_passthrough_stdout());
+        assert!(direct(&["-F"]).preserves_passthrough_stdout());
+        assert!(direct(&["--list-formats"]).preserves_passthrough_stdout());
+        assert!(direct(&["--list-form"]).preserves_passthrough_stdout());
+        assert!(direct(&["--help"]).preserves_passthrough_stdout());
+        assert!(direct(&["-h"]).preserves_passthrough_stdout());
+        assert!(direct(&["-o", "-"]).preserves_passthrough_stdout());
+        assert!(direct(&["--output=-"]).preserves_passthrough_stdout());
+
+        assert!(!direct(&[]).preserves_passthrough_stdout());
+        assert!(!direct(&["--simulate"]).preserves_passthrough_stdout());
+        assert!(!direct(&["-s"]).preserves_passthrough_stdout());
+        assert!(!direct(&["--print-to-file", "title", "out.txt"]).preserves_passthrough_stdout());
+        assert!(!direct(&["-o", "video.%(ext)s"]).preserves_passthrough_stdout());
     }
 }

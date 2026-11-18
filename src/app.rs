@@ -205,6 +205,12 @@ fn execute_download_command(
         }));
     }
 
+    if report.request.preserves_passthrough_stdout() {
+        return Ok(CommandOutput {
+            stdout: String::new(),
+        });
+    }
+
     let status_note = match &report.request.target {
         crate::download::DownloadTarget::DirectUrl { url } => {
             if report.outcome.confirmed_artifacts.is_empty() {

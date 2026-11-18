@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -530,7 +531,7 @@ fn preserves_argv_order_no_preset_and_shell_metacharacters_without_shell() {
     )
     .unwrap();
 
-    // `--help` passthrough omits `--print-to-file` injection and completes cleanly.
+    // `--help` passthrough omits `--print-to-file` injection and avoids polluting stdout with a summary.
     let help_out = run_cli(
         &services,
         &[
@@ -543,7 +544,7 @@ fn preserves_argv_order_no_preset_and_shell_metacharacters_without_shell() {
         ],
     )
     .unwrap();
-    assert!(help_out.contains("without confirmed output artifact"));
+    assert!(help_out.is_empty());
 
     let logs = read_stub_log(&log_path);
     assert_eq!(logs.len(), 3);
@@ -1053,7 +1054,11 @@ fn simulation_leaves_upload_pending_even_when_old_file_exists_on_disk() {
             ],
         )
         .unwrap();
-        assert!(out.contains("remains pending"));
+        if flag == "--dump-json" {
+            assert!(out.is_empty());
+        } else {
+            assert!(out.contains("remains pending"));
+        }
         assert_eq!(
             storage.get_upload(upload.id).unwrap().status,
             UploadStatus::Pending
@@ -1316,4 +1321,256 @@ fn process_failure_and_missing_binary_leave_upload_pending() {
         storage.get_upload(upload.id).unwrap().status,
         UploadStatus::Pending
     );
+}
+
+#[test]
+fn child_cli_passthrough_harness() {
+    let Ok(harness_dir_raw) = env::var("SIPHON_PASSTHROUGH_HARNESS_DIR") else {
+        return;
+    };
+    let harness_dir = PathBuf::from(harness_dir_raw);
+    let work_dir = harness_dir.join("work");
+    let raw_argv = fs::read_to_string(harness_dir.join("argv.txt")).expect("read harness argv");
+    let argv: Vec<String> = raw_argv.lines().map(str::to_owned).collect();
+
+    let storage = TestStorage::new();
+    let seed_path = harness_dir.join("seed_upload.txt");
+    if let Ok(seed) = fs::read_to_string(&seed_path) {
+        let parts: Vec<&str> = seed.trim().split('\t').collect();
+        if parts.len() == 3 {
+            let _ = storage.seed_pending_upload(parts[0], parts[1], parts[2]);
+        }
+    }
+
+    let refresh = NoopRefreshSource;
+    let downloader =
+        YtDlpDownloader::with_binary(compiled_stub_binary()).with_working_dir(&work_dir);
+    let services = AppServices {
+        storage: &storage,
+        refresh_source: &refresh,
+        downloader: &downloader,
+    };
+
+    let cli = Cli::try_parse_from(&argv).expect("harness argv must parse");
+    println!("<<<SIPHON_BEGIN>>>");
+    let _ = std::io::stdout().flush();
+    match execute(cli, &services) {
+        Ok(output) => {
+            print!("{}", output.stdout);
+            let _ = std::io::stdout().flush();
+            println!("<<<SIPHON_END>>>");
+            let _ = std::io::stdout().flush();
+        }
+        Err(err) => {
+            println!("<<<SIPHON_END>>>");
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+    }
+
+    if seed_path.is_file() {
+        let upload = storage.get_upload(UploadId::new(1).unwrap()).unwrap();
+        fs::write(
+            harness_dir.join("upload_status.txt"),
+            upload.status.as_str(),
+        )
+        .unwrap();
+    }
+}
+
+fn invoke_harness_cli(
+    ws: &TempWorkspace,
+    work_dir: &Path,
+    argv: &[&str],
+    seed_upload: Option<(&str, &str, &str)>,
+) -> (String, String, Option<UploadStatus>) {
+    let mut joined = String::new();
+    for arg in argv {
+        joined.push_str(arg);
+        joined.push('\n');
+    }
+    fs::write(ws.path().join("argv.txt"), joined).unwrap();
+    let seed_file = ws.path().join("seed_upload.txt");
+    let status_file = ws.path().join("upload_status.txt");
+    let _ = fs::remove_file(&seed_file);
+    let _ = fs::remove_file(&status_file);
+    if let Some((id, url, title)) = seed_upload {
+        fs::write(&seed_file, format!("{id}\t{url}\t{title}")).unwrap();
+    }
+
+    let current_exe = env::current_exe().expect("current test binary");
+    let output = Command::new(current_exe)
+        .args(["--exact", "child_cli_passthrough_harness", "--nocapture"])
+        .env("SIPHON_PASSTHROUGH_HARNESS_DIR", ws.path())
+        .output()
+        .expect("spawn child harness");
+    assert!(
+        output.status.success(),
+        "child harness failed for {argv:?}:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let full_stdout = String::from_utf8_lossy(&output.stdout);
+    let after_begin = full_stdout
+        .split("<<<SIPHON_BEGIN>>>\n")
+        .nth(1)
+        .or_else(|| full_stdout.split("<<<SIPHON_BEGIN>>>\r\n").nth(1))
+        .expect("missing SIPHON_BEGIN marker");
+    let captured_stdout = after_begin
+        .split("<<<SIPHON_END>>>")
+        .next()
+        .expect("missing SIPHON_END marker")
+        .to_owned();
+    let captured_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let final_status = fs::read_to_string(&status_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let _ = work_dir;
+    (captured_stdout, captured_stderr, final_status)
+}
+
+#[test]
+fn preserves_machine_readable_stdout_and_streams_normal_stdout_and_stderr_progress() {
+    let ws = TempWorkspace::new("passthrough-stdio");
+    let work_dir = ws.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+
+    // 1. Direct passthrough with `-J` yields pure JSON on stdout with zero Siphon summary.
+    write_stub_config(
+        &work_dir,
+        &[(
+            "SIPHON_STUB_STDERR_PROGRESS",
+            "WARNING: simulated extractor notice",
+        )],
+    );
+    let (json_stdout, json_stderr, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1json",
+            "--",
+            "-J",
+        ],
+        None,
+    );
+    let json_trimmed = json_stdout.trim();
+    assert!(json_trimmed.starts_with('{') && json_trimmed.ends_with('}'));
+    assert!(json_trimmed.contains("\"id\":\"BV1json\""));
+    assert!(!json_stdout.contains("Finished direct URL"));
+    assert!(!json_stdout.contains("Downloaded direct URL"));
+    assert!(json_stderr.contains("WARNING: simulated extractor notice"));
+
+    // 2. Direct passthrough with `--print`, `--list-formats`, and `--help` stays clean on stdout.
+    let (print_stdout, _, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1print",
+            "--",
+            "--print",
+            "title",
+        ],
+        None,
+    );
+    assert_eq!(print_stdout.trim(), "Stub Video");
+
+    let (formats_stdout, _, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1formats",
+            "--",
+            "--list-formats",
+        ],
+        None,
+    );
+    assert!(formats_stdout.contains("Available formats for BV1formats"));
+    assert!(!formats_stdout.contains("Finished direct URL"));
+
+    let (help_stdout, _, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1help",
+            "--",
+            "--help",
+        ],
+        None,
+    );
+    assert!(help_stdout.contains("yt-dlp stub"));
+    assert!(!help_stdout.contains("Finished direct URL"));
+
+    // 3. Normal direct download preserves yt-dlp stdout + stderr progress AND appends Siphon summary.
+    write_stub_config(
+        &work_dir,
+        &[(
+            "SIPHON_STUB_STDERR_PROGRESS",
+            "[download] 100% progress on stderr",
+        )],
+    );
+    let (direct_stdout, direct_stderr, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1normaldirect",
+        ],
+        None,
+    );
+    assert!(direct_stdout.contains("[download] Destination:"));
+    assert!(direct_stdout.contains("Downloaded direct URL"));
+    assert!(direct_stderr.contains("[download] 100% progress on stderr"));
+
+    // 4. Normal tracked upload streams yt-dlp stdout + stderr progress AND marks upload Downloaded.
+    let (tracked_stdout, tracked_stderr, tracked_status) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &["siphon", "download", "--upload", "1"],
+        Some((
+            "BV1tracked",
+            "https://www.bilibili.com/video/BV1tracked",
+            "Tracked Stream",
+        )),
+    );
+    assert!(tracked_stdout.contains("[download] Destination:"));
+    assert!(tracked_stdout.contains("marked as downloaded"));
+    assert!(tracked_stderr.contains("[download] 100% progress on stderr"));
+    assert_eq!(tracked_status, Some(UploadStatus::Downloaded));
+
+    // 5. Tracked upload with `--print after_move:filepath` marks Downloaded without Siphon stdout summary.
+    let (tracked_print_stdout, _, tracked_print_status) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "--upload",
+            "1",
+            "--",
+            "--print",
+            "after_move:filepath",
+        ],
+        Some((
+            "BV1trackedprint",
+            "https://www.bilibili.com/video/BV1trackedprint",
+            "Tracked Print",
+        )),
+    );
+    assert!(
+        tracked_print_stdout
+            .trim()
+            .ends_with("Stub Video [BV1trackedprint].mp4")
+    );
+    assert!(!tracked_print_stdout.contains("marked as downloaded"));
+    assert_eq!(tracked_print_status, Some(UploadStatus::Downloaded));
 }

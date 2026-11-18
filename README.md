@@ -34,8 +34,11 @@ Siphon is a Rust CLI rewrite of `mrm`.
 | `siphon preset list` | List download presets. |
 | `siphon preset remove <NAME>` | Remove a download preset. |
 | `siphon preset set-default <NAME>` | Set the default download preset. |
+| `siphon job status <ID>` | Inspect status, timing, progress, and outcome of a background job. |
 
 Use `--preset <NAME>` on either download command to select a preset for that invocation, or `--db <PATH>` (or `SIPHON_DB`) on any command to override the default per-user SQLite database path (`$XDG_DATA_HOME/siphon/siphon.db` or `~/.local/share/siphon/siphon.db` on Linux, `~/Library/Application Support/siphon/siphon.db` on macOS, `%LOCALAPPDATA%\siphon\siphon.db` on Windows).
+
+Pass `--background` to `siphon refresh` or `siphon download` to run the operation in a detached local worker process and return a durable job ID once the worker acknowledges ownership. Query progress and outcomes with `siphon job status <ID>` (pass `--json` for structured machine output). Foreground and background operations share the same database occupancy rules (one active `refresh` at a time, one active `download --upload <ID>` per upload, concurrent direct URL downloads), and background downloads reject options that stream media to `stdout` (`-o -`). Persisted job history redacts URL credentials, query strings, and fragments and never stores cookie sources, working directories, or raw download arguments.
 
 `siphon download` routes Siphon status summaries to `stderr` so `yt-dlp` `stdout` (such as `-J` or `--print`) passes through uncontaminated.
 

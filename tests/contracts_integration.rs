@@ -7,9 +7,9 @@ use clap::Parser;
 use siphon::app::{AppServices, execute};
 use siphon::cli::Cli;
 use siphon::domain::{
-    CookieSource, Creator, CreatorId, DiscoveredUpload, DownloadPreset, Follow, FollowedCreator,
-    Platform, PresetName, PresetSummary, Timestamp, Upload, UploadId, UploadStatus,
-    builtin_video_preset,
+    CookieSource, Creator, CreatorId, DiscoveredUpload, DownloadPreset, Follow, FollowId,
+    FollowedCreator, Platform, PresetName, PresetSummary, Timestamp, Upload, UploadId,
+    UploadStatus, builtin_video_preset,
 };
 use siphon::download::{DownloadOutcome, DownloadRequest, Downloader};
 use siphon::error::{AppError, DownloadError, RefreshError, StorageError};
@@ -21,6 +21,7 @@ use siphon::storage::{
 #[derive(Default)]
 struct MemoryState {
     next_creator_id: i64,
+    next_follow_id: i64,
     next_upload_id: i64,
     creators: BTreeMap<CreatorId, Creator>,
     follows: BTreeMap<CreatorId, Follow>,
@@ -39,6 +40,7 @@ impl InMemoryStorage {
         Self {
             state: Mutex::new(MemoryState {
                 next_creator_id: 1,
+                next_follow_id: 1,
                 next_upload_id: 1,
                 ..MemoryState::default()
             }),
@@ -99,7 +101,10 @@ impl Storage for InMemoryStorage {
             creator
         };
 
+        let follow_id = FollowId::new(guard.next_follow_id).unwrap();
+        guard.next_follow_id += 1;
         let follow = Follow {
+            id: follow_id,
             creator_id: creator.id,
             followed_at: request.followed_at,
             refresh_checkpoint: request.followed_at,
@@ -164,7 +169,8 @@ impl Storage for InMemoryStorage {
             },
         )?;
 
-        if follow.followed_at != request.expected_follow_time
+        if follow.id != request.expected_follow_id
+            || follow.followed_at != request.expected_follow_time
             || follow.refresh_checkpoint != request.expected_checkpoint
         {
             return Err(StorageError::StaleRefreshCheckpoint {
@@ -392,6 +398,7 @@ impl Storage for InMemoryStorage {
 struct StubRefreshSource {
     fail_for_mid: Option<String>,
     mutate_checkpoint_for: Option<(CreatorId, Timestamp)>,
+    same_second_refollow_for: Mutex<Option<(CreatorId, Timestamp)>>,
     seen_cookies: Mutex<Vec<Option<CookieSource>>>,
     storage_ref: Option<*const InMemoryStorage>,
 }
@@ -405,6 +412,7 @@ impl StubRefreshSource {
         Self {
             fail_for_mid: None,
             mutate_checkpoint_for: None,
+            same_second_refollow_for: Mutex::new(None),
             seen_cookies: Mutex::new(Vec::new()),
             storage_ref: None,
         }
@@ -445,6 +453,23 @@ impl RefreshSource for StubRefreshSource {
         {
             // Safety: test keeps storage alive across call.
             unsafe { &*storage_ptr }.set_checkpoint_direct(target_id, new_cp);
+        }
+        if let Some((target_id, same_second)) = self.same_second_refollow_for.lock().unwrap().take()
+            && creator.id == target_id
+            && let Some(storage_ptr) = self.storage_ref
+        {
+            // Simulate unfollow and immediate re-follow within the exact same second.
+            // Safety: test keeps storage alive across call.
+            let storage = unsafe { &*storage_ptr };
+            let old = storage.unfollow_creator(target_id).unwrap();
+            storage
+                .follow_creator(FollowCreatorRequest {
+                    platform: old.platform,
+                    platform_creator_id: old.platform_creator_id,
+                    display_name: old.display_name,
+                    followed_at: same_second,
+                })
+                .unwrap();
         }
         if self.fail_for_mid.as_deref() == Some(creator.platform_creator_id.as_str()) {
             return Err(RefreshError::Network("simulated 502".to_owned()));
@@ -589,7 +614,12 @@ fn follow_unfollow_refollow_and_independent_refresh_isolation() {
     assert!(cp2_after > cp2_before);
     assert_eq!(storage.list_pending_uploads().unwrap().len(), 1);
 
-    // Unfollow keeps creator 2's uploads; re-following reuses CreatorId(2).
+    // Unfollow keeps creator 2's uploads; re-following reuses CreatorId(2) with a fresh FollowId.
+    let follow_id_before = storage
+        .get_followed_creator(CreatorId::new(2).unwrap())
+        .unwrap()
+        .follow
+        .id;
     run_cmd(&services, &["siphon", "creator", "remove", "2"]).unwrap();
     assert_eq!(storage.list_pending_uploads().unwrap().len(), 1);
     let refollow = run_cmd(
@@ -598,6 +628,58 @@ fn follow_unfollow_refollow_and_independent_refresh_isolation() {
     )
     .unwrap();
     assert!(refollow.contains("Followed creator 2"));
+    let follow_id_after = storage
+        .get_followed_creator(CreatorId::new(2).unwrap())
+        .unwrap()
+        .follow
+        .id;
+    assert!(follow_id_after > follow_id_before);
+}
+
+#[test]
+fn commit_refresh_rejects_same_second_unfollow_and_refollow_by_follow_id() {
+    let storage = InMemoryStorage::new();
+    let same_second = Timestamp::from_unix_seconds(1_760_000_000);
+    let followed = storage
+        .follow_creator(FollowCreatorRequest {
+            platform: Platform::Bilibili,
+            platform_creator_id: "301".to_owned(),
+            display_name: "Creator 301".to_owned(),
+            followed_at: same_second,
+        })
+        .unwrap();
+    assert_eq!(followed.follow.id, FollowId::new(1).unwrap());
+
+    let mut refresh = StubRefreshSource::new();
+    *refresh.same_second_refollow_for.lock().unwrap() = Some((followed.creator.id, same_second));
+    refresh.storage_ref = Some(&storage as *const InMemoryStorage);
+    let downloader = StubDownloader::simulation();
+    let services = AppServices {
+        storage: &storage,
+        refresh_source: &refresh,
+        downloader: &downloader,
+    };
+
+    // During fetch, the creator was unfollowed and re-followed at the exact same timestamp.
+    // Even though followed_at and refresh_checkpoint match, the stale FollowId(1) must abort.
+    let err = run_cmd(&services, &["siphon", "refresh", "1"]).unwrap_err();
+    match err {
+        AppError::RefreshPartialFailure { failures, .. } => {
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0].error.contains("checkpoint changed"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(storage.list_pending_uploads().unwrap().is_empty());
+
+    let current = storage.get_followed_creator(followed.creator.id).unwrap();
+    assert_eq!(current.follow.id, FollowId::new(2).unwrap());
+    assert_eq!(current.follow.followed_at, same_second);
+    assert_eq!(current.follow.refresh_checkpoint, same_second);
+
+    // Subsequent refresh using the new FollowId(2) commits cleanly.
+    run_cmd(&services, &["siphon", "refresh", "1"]).unwrap();
+    assert_eq!(storage.list_pending_uploads().unwrap().len(), 1);
 }
 
 #[test]

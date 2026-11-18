@@ -21,6 +21,13 @@ pub enum ValidationError {
         input: String,
     },
 
+    /// Follow ID could not be parsed as a positive integer.
+    #[error("invalid follow ID '{input}': expected a positive integer")]
+    InvalidFollowId {
+        /// Raw user-provided value.
+        input: String,
+    },
+
     /// Preset name failed syntax rules.
     #[error("invalid preset name '{input}': {reason}")]
     InvalidPresetName {

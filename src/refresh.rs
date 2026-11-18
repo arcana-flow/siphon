@@ -245,6 +245,7 @@ fn refresh_single_creator(
 
     let outcome = storage.commit_refresh(CommitRefreshRequest {
         creator_id: target.creator.id,
+        expected_follow_id: target.follow.id,
         expected_follow_time: target.follow.followed_at,
         expected_checkpoint: target.follow.refresh_checkpoint,
         new_checkpoint,

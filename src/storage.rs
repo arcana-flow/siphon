@@ -1,8 +1,8 @@
 //! Stable storage integration contract for Siphon's local SQLite persistence.
 
 use crate::domain::{
-    CookieSource, Creator, CreatorId, DiscoveredUpload, DownloadPreset, FollowedCreator, Platform,
-    PresetName, PresetSummary, Timestamp, Upload, UploadId,
+    CookieSource, Creator, CreatorId, DiscoveredUpload, DownloadPreset, FollowId, FollowedCreator,
+    Platform, PresetName, PresetSummary, Timestamp, Upload, UploadId,
 };
 use crate::error::StorageError;
 
@@ -24,6 +24,8 @@ pub struct FollowCreatorRequest {
 pub struct CommitRefreshRequest {
     /// Followed creator being refreshed.
     pub creator_id: CreatorId,
+    /// Durable follow ID observed before fetching; must still match on commit.
+    pub expected_follow_id: FollowId,
     /// Active follow start time observed before fetching; must still match on commit.
     pub expected_follow_time: Timestamp,
     /// Refresh checkpoint observed before fetching; must still match on commit.
@@ -68,7 +70,8 @@ pub trait Storage: Send + Sync {
     /// Follows a creator, reusing its existing [`CreatorId`] if it was previously unfollowed.
     ///
     /// Returns [`StorageError::CreatorAlreadyFollowed`] if the creator already has an active
-    /// follow. Otherwise initializes both `followed_at` and `refresh_checkpoint` to
+    /// follow. Otherwise assigns a fresh durable [`FollowId`] (never reusing prior IDs across
+    /// unfollow/re-follow) and initializes both `followed_at` and `refresh_checkpoint` to
     /// `request.followed_at`.
     fn follow_creator(
         &self,
@@ -93,9 +96,10 @@ pub trait Storage: Send + Sync {
     /// Atomically persists discovered uploads and advances the creator's refresh checkpoint.
     ///
     /// Must verify in the same transaction that an active follow exists for `request.creator_id`
-    /// with `followed_at == request.expected_follow_time` and
+    /// with `id == request.expected_follow_id`, `followed_at == request.expected_follow_time`, and
     /// `refresh_checkpoint == request.expected_checkpoint`; otherwise fails with
-    /// [`StorageError::StaleRefreshCheckpoint`]. Existing uploads keyed by
+    /// [`StorageError::StaleRefreshCheckpoint`]. Comparing by [`FollowId`] ensures a same-second
+    /// unfollow and re-follow is rejected even when timestamps are equal. Existing uploads keyed by
     /// `(platform, platform_upload_id)` must retain their current status.
     fn commit_refresh(
         &self,

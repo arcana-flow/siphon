@@ -29,93 +29,71 @@ pub fn builtin_video_preset() -> DownloadPreset {
     }
 }
 
-/// Stable local identifier for a creator stored in Siphon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CreatorId(i64);
+macro_rules! define_positive_id {
+    ($(#[$meta:meta])* $name:ident, $err_variant:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(i64);
 
-impl CreatorId {
-    /// Creates a validated positive [`CreatorId`].
-    pub fn new(id: i64) -> Result<Self, ValidationError> {
-        if id <= 0 {
-            return Err(ValidationError::InvalidCreatorId {
-                input: id.to_string(),
-            });
+        impl $name {
+            /// Creates a validated positive identifier.
+            pub fn new(id: i64) -> Result<Self, ValidationError> {
+                if id <= 0 {
+                    return Err(ValidationError::$err_variant {
+                        input: id.to_string(),
+                    });
+                }
+                Ok(Self(id))
+            }
+
+            /// Returns the underlying integer identifier.
+            #[must_use]
+            pub const fn as_i64(self) -> i64 {
+                self.0
+            }
         }
-        Ok(Self(id))
-    }
 
-    /// Returns the underlying integer identifier.
-    #[must_use]
-    pub const fn as_i64(self) -> i64 {
-        self.0
-    }
-}
-
-impl fmt::Display for CreatorId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl FromStr for CreatorId {
-    type Err = ValidationError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let trimmed = s.trim();
-        let parsed = trimmed
-            .parse::<i64>()
-            .map_err(|_| ValidationError::InvalidCreatorId {
-                input: s.to_owned(),
-            })?;
-        Self::new(parsed).map_err(|_| ValidationError::InvalidCreatorId {
-            input: s.to_owned(),
-        })
-    }
-}
-
-/// Stable local identifier for a tracked upload stored in Siphon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UploadId(i64);
-
-impl UploadId {
-    /// Creates a validated positive [`UploadId`].
-    pub fn new(id: i64) -> Result<Self, ValidationError> {
-        if id <= 0 {
-            return Err(ValidationError::InvalidUploadId {
-                input: id.to_string(),
-            });
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
         }
-        Ok(Self(id))
-    }
 
-    /// Returns the underlying integer identifier.
-    #[must_use]
-    pub const fn as_i64(self) -> i64 {
-        self.0
-    }
+        impl FromStr for $name {
+            type Err = ValidationError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                let parsed = s
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| ValidationError::$err_variant {
+                        input: s.to_owned(),
+                    })?;
+                Self::new(parsed).map_err(|_| ValidationError::$err_variant {
+                    input: s.to_owned(),
+                })
+            }
+        }
+    };
 }
 
-impl fmt::Display for UploadId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+define_positive_id!(
+    /// Stable local identifier for a creator stored in Siphon.
+    CreatorId,
+    InvalidCreatorId
+);
 
-impl FromStr for UploadId {
-    type Err = ValidationError;
+define_positive_id!(
+    /// Stable local identifier for a tracked upload stored in Siphon.
+    UploadId,
+    InvalidUploadId
+);
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let trimmed = s.trim();
-        let parsed = trimmed
-            .parse::<i64>()
-            .map_err(|_| ValidationError::InvalidUploadId {
-                input: s.to_owned(),
-            })?;
-        Self::new(parsed).map_err(|_| ValidationError::InvalidUploadId {
-            input: s.to_owned(),
-        })
-    }
-}
+define_positive_id!(
+    /// Durable unique local identifier for an active follow instance stored in Siphon.
+    FollowId,
+    InvalidFollowId
+);
 
 /// Validated download preset name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -354,6 +332,8 @@ pub struct Creator {
 /// Active follow metadata and refresh boundary for a creator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Follow {
+    /// Durable unique local identifier for this active follow instance (fresh on each re-follow).
+    pub id: FollowId,
     /// Local creator ID being followed.
     pub creator_id: CreatorId,
     /// Timestamp when the active follow began.
@@ -543,6 +523,10 @@ mod tests {
 
         assert_eq!("9".parse::<UploadId>().unwrap().as_i64(), 9);
         assert!("0".parse::<UploadId>().is_err());
+
+        assert_eq!("11".parse::<FollowId>().unwrap().as_i64(), 11);
+        assert!("0".parse::<FollowId>().is_err());
+        assert!("-3".parse::<FollowId>().is_err());
 
         assert_eq!("bilibili".parse::<Platform>().unwrap(), Platform::Bilibili);
         assert!("youtube".parse::<Platform>().is_err());

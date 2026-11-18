@@ -16,6 +16,7 @@ pub mod domain;
 pub mod download;
 pub mod error;
 pub mod jobs;
+pub mod output;
 pub mod platform;
 pub mod refresh;
 pub mod storage;

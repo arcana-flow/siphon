@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use clap::Parser;
-use siphon::app::{AppServices, execute};
+use siphon::app::{AppExecuteOptions, AppServices, execute, execute_with_options};
 use siphon::cli::Cli;
 use siphon::domain::{
     CookieSource, Creator, CreatorId, DownloadPreset, Follow, FollowId, FollowedCreator, Platform,
     PresetName, PresetSummary, Timestamp, Upload, UploadId, UploadStatus, builtin_video_preset,
 };
-use siphon::download::{DownloadTarget, Downloader, YtDlpDownloader};
+use siphon::download::{DownloadExecutionOptions, DownloadTarget, Downloader, YtDlpDownloader};
 use siphon::error::{AppError, DownloadError, RefreshError, StorageError};
 use siphon::refresh::{RefreshFeedResult, RefreshSource, ResolvedCreator};
 use siphon::storage::{
@@ -1364,22 +1364,61 @@ fn child_cli_passthrough_harness() {
     };
 
     let cli = Cli::try_parse_from(&argv).expect("harness argv must parse");
+    let stream_mode = env::var("SIPHON_HARNESS_STREAM_MODE").unwrap_or_default();
     println!("<<<SIPHON_BEGIN>>>");
     let _ = std::io::stdout().flush();
-    match execute(cli, &services) {
-        Ok(output) => {
-            print!("{}", output.stdout);
-            let _ = std::io::stdout().flush();
-            eprint!("{}", output.stderr);
-            let _ = std::io::stderr().flush();
+    match stream_mode.as_str() {
+        "json" => {
+            let exec = execute_with_options(
+                cli,
+                &services,
+                AppExecuteOptions {
+                    download: DownloadExecutionOptions::json_mode(),
+                },
+            );
+            if let Some(err) = exec.error {
+                println!("<<<SIPHON_END>>>");
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            if let Some(res) = exec.result {
+                print!("{}", res.to_json_line().unwrap());
+                let _ = std::io::stdout().flush();
+            }
             println!("<<<SIPHON_END>>>");
             let _ = std::io::stdout().flush();
         }
-        Err(err) => {
+        "silent" => {
+            let exec = execute_with_options(
+                cli,
+                &services,
+                AppExecuteOptions {
+                    download: DownloadExecutionOptions::background_capture(),
+                },
+            );
+            if let Some(err) = exec.error {
+                println!("<<<SIPHON_END>>>");
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
             println!("<<<SIPHON_END>>>");
-            eprintln!("error: {err}");
-            std::process::exit(1);
+            let _ = std::io::stdout().flush();
         }
+        _ => match execute(cli, &services) {
+            Ok(output) => {
+                print!("{}", output.stdout);
+                let _ = std::io::stdout().flush();
+                eprint!("{}", output.stderr);
+                let _ = std::io::stderr().flush();
+                println!("<<<SIPHON_END>>>");
+                let _ = std::io::stdout().flush();
+            }
+            Err(err) => {
+                println!("<<<SIPHON_END>>>");
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        },
     }
 
     if seed_path.is_file() {
@@ -1669,4 +1708,111 @@ fn config_and_alias_json_passthrough_keeps_stdout_transparent() {
     assert!(alias_trimmed.contains("\"id\":\"BV1aliasjson\""));
     assert!(!alias_stdout.contains("Finished direct URL"));
     assert!(alias_stderr.contains("Finished direct URL"));
+}
+
+fn invoke_harness_cli_with_mode(
+    ws: &TempWorkspace,
+    argv: &[&str],
+    seed_upload: Option<(&str, &str, &str)>,
+    mode: &str,
+) -> (String, String, Option<UploadStatus>) {
+    let mut joined = String::new();
+    for arg in argv {
+        joined.push_str(arg);
+        joined.push('\n');
+    }
+    fs::write(ws.path().join("argv.txt"), joined).unwrap();
+    let seed_file = ws.path().join("seed_upload.txt");
+    let status_file = ws.path().join("upload_status.txt");
+    let _ = fs::remove_file(&seed_file);
+    let _ = fs::remove_file(&status_file);
+    if let Some((id, url, title)) = seed_upload {
+        fs::write(&seed_file, format!("{id}\t{url}\t{title}")).unwrap();
+    }
+
+    let current_exe = env::current_exe().expect("current test binary");
+    let output = Command::new(current_exe)
+        .args(["--exact", "child_cli_passthrough_harness", "--nocapture"])
+        .env("SIPHON_PASSTHROUGH_HARNESS_DIR", ws.path())
+        .env("SIPHON_HARNESS_STREAM_MODE", mode)
+        .output()
+        .expect("spawn child harness");
+    assert!(
+        output.status.success(),
+        "child harness failed for {argv:?}:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let full_stdout = String::from_utf8_lossy(&output.stdout);
+    let after_begin = full_stdout
+        .split("<<<SIPHON_BEGIN>>>\n")
+        .nth(1)
+        .or_else(|| full_stdout.split("<<<SIPHON_BEGIN>>>\r\n").nth(1))
+        .expect("missing SIPHON_BEGIN marker");
+    let captured_stdout = after_begin
+        .split("<<<SIPHON_END>>>")
+        .next()
+        .expect("missing SIPHON_END marker")
+        .to_owned();
+    let captured_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let final_status = fs::read_to_string(&status_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    (captured_stdout, captured_stderr, final_status)
+}
+
+#[test]
+fn stream_modes_redirect_to_stderr_and_capture_silently_for_background_jobs() {
+    let ws = TempWorkspace::new("stream-modes");
+    let work_dir = ws.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    write_stub_config(
+        &work_dir,
+        &[(
+            "SIPHON_STUB_STDERR_PROGRESS",
+            "[download] 100% progress on stderr",
+        )],
+    );
+
+    // 1. JSON stream mode redirects yt-dlp `-J` stdout and progress to stderr while reserving stdout.
+    let (json_stdout, json_stderr, _) = invoke_harness_cli_with_mode(
+        &ws,
+        &[
+            "siphon",
+            "--json",
+            "download",
+            "https://www.bilibili.com/video/BV1redirect",
+            "--",
+            "-J",
+        ],
+        None,
+        "json",
+    );
+    let parsed: serde_json::Value = serde_json::from_str(json_stdout.trim()).unwrap();
+    assert_eq!(parsed["ok"], true);
+    assert!(json_stderr.contains("\"id\":\"BV1redirect\""));
+    assert!(json_stderr.contains("[download] 100% progress on stderr"));
+
+    // 2. Background capture mode emits nothing on stdout or stderr while still confirming artifacts.
+    let (silent_stdout, silent_stderr, silent_status) = invoke_harness_cli_with_mode(
+        &ws,
+        &["siphon", "download", "--upload", "1"],
+        Some((
+            "BV1silent",
+            "https://www.bilibili.com/video/BV1silent",
+            "Silent Job",
+        )),
+        "silent",
+    );
+    assert!(
+        silent_stdout.is_empty(),
+        "unexpected stdout: {silent_stdout}"
+    );
+    assert!(
+        silent_stderr.is_empty(),
+        "unexpected stderr: {silent_stderr}"
+    );
+    assert_eq!(silent_status, Some(UploadStatus::Downloaded));
+    assert!(work_dir.join("Stub Video [BV1silent].mp4").is_file());
 }

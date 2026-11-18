@@ -1,8 +1,9 @@
 //! Command-line argument definitions (`clap`) matching the Siphon CLI specification.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::domain::{CookieSource, CreatorId, NonEmptyString, PresetName, UploadId};
 use crate::download::{DownloadPlanInput, DownloadTargetInput, PresetSelection};
@@ -30,9 +31,56 @@ pub struct Cli {
     )]
     pub db: Option<PathBuf>,
 
+    /// Emit a single structured JSON response on stdout and redirect downloader text output to stderr.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Primary Siphon subcommand.
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Returns `true` if `--json` was supplied before the first `--` separator.
+#[must_use]
+pub fn has_json_flag<I, T>(args: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    for arg in args.into_iter().skip(1) {
+        let Some(text) = arg.as_ref().to_str() else {
+            continue;
+        };
+        if text == "--" {
+            break;
+        }
+        if text == "--json" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolves the command path and [`clap::Command`] matching a rendered `clap` `Usage:` line.
+#[must_use]
+pub fn resolve_command_from_usage(usage_line: &str) -> (Vec<String>, clap::Command) {
+    let mut current = Cli::command();
+    current.build();
+    let mut path = vec![current.get_name().to_owned()];
+
+    for token in usage_line.split_whitespace().skip(1) {
+        if token.starts_with('[') || token.starts_with('<') || token.starts_with('-') {
+            break;
+        }
+        if let Some(sub) = current.find_subcommand(token).cloned() {
+            path.push(sub.get_name().to_owned());
+            current = sub;
+        } else {
+            break;
+        }
+    }
+
+    (path, current)
 }
 
 /// Top-level Siphon subcommands.
@@ -329,4 +377,80 @@ fn parse_non_empty_path(raw: &str) -> Result<PathBuf, ValidationError> {
         return Err(ValidationError::EmptyValue { field: "path" });
     }
     Ok(PathBuf::from(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_json_flag_only_when_supplied_as_siphon_option() {
+        assert!(has_json_flag(["siphon", "--json"]));
+        assert!(has_json_flag(["siphon", "--json", "--help"]));
+        assert!(has_json_flag(["siphon", "--help", "--json"]));
+        assert!(has_json_flag(["siphon", "creator", "list", "--json"]));
+        assert!(has_json_flag([
+            "siphon",
+            "--db",
+            "/tmp/siphon.db",
+            "--json",
+            "download",
+            "https://example.com",
+            "--",
+            "-J",
+        ]));
+        assert!(has_json_flag([
+            "siphon",
+            "download",
+            "https://example.com",
+            "--json",
+            "--",
+            "-o",
+            "-",
+        ]));
+
+        // `--json` after `--` belongs to yt-dlp / preset args, not Siphon.
+        assert!(!has_json_flag([
+            "siphon",
+            "download",
+            "https://example.com",
+            "--",
+            "--json",
+        ]));
+        assert!(!has_json_flag([
+            "siphon", "preset", "add", "custom", "--", "--json",
+        ]));
+        // Explicit `--json` alongside a missing option value still triggers JSON error output.
+        assert!(has_json_flag([
+            "siphon", "--db", "--json", "creator", "list"
+        ]));
+        assert!(has_json_flag([
+            "siphon",
+            "download",
+            "https://example.com",
+            "--cookies",
+            "--json",
+        ]));
+    }
+
+    #[test]
+    fn resolves_command_paths_from_clap_usage_lines() {
+        let (root_path, root_cmd) = resolve_command_from_usage("siphon [OPTIONS] <COMMAND>");
+        assert_eq!(root_path, vec!["siphon"]);
+        assert_eq!(root_cmd.get_name(), "siphon");
+
+        let (creator_path, creator_cmd) =
+            resolve_command_from_usage("siphon creator [OPTIONS] <COMMAND>");
+        assert_eq!(creator_path, vec!["siphon", "creator"]);
+        assert_eq!(creator_cmd.get_name(), "creator");
+
+        let (add_path, add_cmd) = resolve_command_from_usage("siphon creator add [OPTIONS] <URL>");
+        assert_eq!(add_path, vec!["siphon", "creator", "add"]);
+        assert_eq!(add_cmd.get_name(), "add");
+
+        let (preset_add_path, preset_add_cmd) =
+            resolve_command_from_usage("siphon preset add [OPTIONS] <NAME> -- <ARGS>...");
+        assert_eq!(preset_add_path, vec!["siphon", "preset", "add"]);
+        assert_eq!(preset_add_cmd.get_name(), "add");
+    }
 }

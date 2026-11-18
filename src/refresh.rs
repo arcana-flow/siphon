@@ -188,13 +188,13 @@ pub fn refresh_creators(
     creator_id: Option<CreatorId>,
     cookie_policy: RefreshCookiePolicy,
 ) -> Result<RefreshSummary, AppError> {
-    let (used_cookies, cleared_default_cookies, saved_default_cookies) =
-        resolve_refresh_cookies(storage, cookie_policy)?;
-
     let targets = match creator_id {
         Some(id) => vec![storage.get_followed_creator(id)?],
         None => storage.list_followed_creators()?,
     };
+
+    let (used_cookies, cleared_default_cookies, saved_default_cookies) =
+        resolve_refresh_cookies(storage, cookie_policy)?;
 
     let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {

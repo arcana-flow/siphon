@@ -1,7 +1,10 @@
 //! Runtime configuration and cross-platform SQLite database path resolution.
 
 use std::env;
+use std::net::IpAddr;
 use std::path::PathBuf;
+
+use url::{Host, Url};
 
 /// Application runtime configuration resolved from CLI arguments and environment variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,4 +62,119 @@ where
     }
 
     PathBuf::from("siphon.db")
+}
+
+/// Resolves an optional Bilibili API base URL override from `SIPHON_BILIBILI_API_BASE`.
+///
+/// Permits `https://` URLs or loopback `http://` URLs (`localhost`, `127.0.0.1`, `::1`)
+/// so offline fixtures and local mock servers can run against the CLI binary without
+/// exposing cookie headers over non-loopback plaintext HTTP.
+pub fn resolve_bilibili_api_base() -> Result<Option<String>, String> {
+    resolve_bilibili_api_base_from_env(|key| env::var(key).ok())
+}
+
+/// Resolves an optional Bilibili API base URL override using an explicit environment lookup.
+pub fn resolve_bilibili_api_base_from_env<F>(get_env: F) -> Result<Option<String>, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(raw) = get_env("SIPHON_BILIBILI_API_BASE") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = Url::parse(trimmed)
+        .map_err(|err| format!("invalid SIPHON_BILIBILI_API_BASE '{trimmed}': {err}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(
+            "invalid SIPHON_BILIBILI_API_BASE: embedded credentials are not allowed".to_owned(),
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(
+            "invalid SIPHON_BILIBILI_API_BASE: query parameters and fragments are not allowed"
+                .to_owned(),
+        );
+    }
+
+    let Some(host) = parsed.host() else {
+        return Err("invalid SIPHON_BILIBILI_API_BASE: missing host".to_owned());
+    };
+    match parsed.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(&host) => {}
+        "http" => {
+            return Err(format!(
+                "invalid SIPHON_BILIBILI_API_BASE '{trimmed}': plaintext http is only allowed for loopback hosts"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "invalid SIPHON_BILIBILI_API_BASE '{trimmed}': unsupported scheme '{other}'"
+            ));
+        }
+    }
+
+    Ok(Some(trimmed.trim_end_matches('/').to_owned()))
+}
+
+fn is_loopback_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(ip) => IpAddr::V4(*ip).is_loopback(),
+        Host::Ipv6(ip) => IpAddr::V6(*ip).is_loopback(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_and_validates_bilibili_api_base_override() {
+        assert_eq!(resolve_bilibili_api_base_from_env(|_| None).unwrap(), None);
+        assert_eq!(
+            resolve_bilibili_api_base_from_env(|_| Some("   ".to_owned())).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://127.0.0.1:8080/".to_owned()))
+                .unwrap(),
+            Some("http://127.0.0.1:8080".to_owned())
+        );
+        assert_eq!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://localhost:9000".to_owned()))
+                .unwrap(),
+            Some("http://localhost:9000".to_owned())
+        );
+        assert_eq!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://[::1]:8123/".to_owned())).unwrap(),
+            Some("http://[::1]:8123".to_owned())
+        );
+        assert_eq!(
+            resolve_bilibili_api_base_from_env(|_| Some("https://api.example.test/".to_owned()))
+                .unwrap(),
+            Some("https://api.example.test".to_owned())
+        );
+
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://example.com".to_owned())).is_err()
+        );
+        assert!(resolve_bilibili_api_base_from_env(|_| Some("not-a-url".to_owned())).is_err());
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("ftp://127.0.0.1:8080".to_owned()))
+                .is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://user:pass@127.0.0.1".to_owned()))
+                .is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://127.0.0.1:8080?x=1".to_owned()))
+                .is_err()
+        );
+    }
 }

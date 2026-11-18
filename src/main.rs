@@ -3,18 +3,37 @@ use std::process::ExitCode;
 use clap::Parser;
 use siphon::app::{AppServices, execute};
 use siphon::cli::Cli;
-use siphon::config::RuntimeConfig;
-use siphon::download::UnimplementedDownloader;
-use siphon::refresh::UnimplementedRefreshSource;
-use siphon::storage::UnimplementedStorage;
+use siphon::config::{RuntimeConfig, resolve_bilibili_api_base};
+use siphon::download::YtDlpDownloader;
+use siphon::platform::bilibili::{BilibiliClientConfig, BilibiliRefreshSource};
+use siphon::storage::SqliteStorage;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let _config = RuntimeConfig::resolve(cli.db.clone());
+    let config = RuntimeConfig::resolve(cli.db.clone());
 
-    let storage = UnimplementedStorage;
-    let refresh_source = UnimplementedRefreshSource;
-    let downloader = UnimplementedDownloader;
+    let api_base = match resolve_bilibili_api_base() {
+        Ok(base) => base,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let storage = match SqliteStorage::open(&config.db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut bili_config = BilibiliClientConfig::default();
+    if let Some(base_url) = api_base {
+        bili_config = bili_config.with_api_base_url(base_url);
+    }
+    let refresh_source = BilibiliRefreshSource::with_config(bili_config);
+    let downloader = YtDlpDownloader::new();
     let services = AppServices {
         storage: &storage,
         refresh_source: &refresh_source,

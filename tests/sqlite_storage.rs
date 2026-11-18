@@ -538,6 +538,9 @@ fn presets_defaults_and_refresh_cookies_persist_across_reopen() {
     let audio = PresetName::new("audio").unwrap();
     let subs = PresetName::new("subs").unwrap();
 
+    let cookie_file_path = temp.path().join("siphon cookies").join("netscape.txt");
+    let cookie_file_path_reopen = cookie_file_path.clone();
+
     {
         let storage = SqliteStorage::open(&db_path).unwrap();
 
@@ -613,7 +616,7 @@ fn presets_defaults_and_refresh_cookies_persist_across_reopen() {
             }
         );
 
-        let file_cookies = CookieSource::File(PathBuf::from("/tmp/siphon cookies/netscape.txt"));
+        let file_cookies = CookieSource::File(cookie_file_path.clone());
         storage
             .set_default_refresh_cookies(Some(&file_cookies))
             .unwrap();
@@ -628,9 +631,7 @@ fn presets_defaults_and_refresh_cookies_persist_across_reopen() {
     assert_eq!(reopened.get_default_preset().unwrap().name, audio);
     assert_eq!(
         reopened.get_default_refresh_cookies().unwrap(),
-        Some(CookieSource::File(PathBuf::from(
-            "/tmp/siphon cookies/netscape.txt"
-        )))
+        Some(CookieSource::File(cookie_file_path_reopen))
     );
 
     let listed = reopened.list_presets().unwrap();
@@ -742,7 +743,17 @@ fn corrupted_preference_rows_surface_corrupted_data_errors() {
     ));
 }
 
-struct StubRefresh;
+struct StubRefresh {
+    seen_cookies: Mutex<Vec<Option<CookieSource>>>,
+}
+
+impl StubRefresh {
+    fn new() -> Self {
+        Self {
+            seen_cookies: Mutex::new(Vec::new()),
+        }
+    }
+}
 
 impl RefreshSource for StubRefresh {
     fn resolve_creator(
@@ -762,8 +773,9 @@ impl RefreshSource for StubRefresh {
         &self,
         creator: &Creator,
         checkpoint: Timestamp,
-        _cookies: Option<&CookieSource>,
+        cookies: Option<&CookieSource>,
     ) -> Result<RefreshFeedResult, RefreshError> {
+        self.seen_cookies.lock().unwrap().push(cookies.cloned());
         let published_at = Timestamp::from_unix_seconds(checkpoint.as_unix_seconds() + 60);
         Ok(RefreshFeedResult {
             uploads: vec![DiscoveredUpload {
@@ -813,10 +825,139 @@ fn run_cli(services: &AppServices<'_>, argv: &[&str]) -> Result<String, AppError
 }
 
 #[test]
+fn saved_relative_cookie_file_resolves_against_cwd_without_canonicalization_or_existence() {
+    let temp = TempDir::new("relative-cookie-path");
+    let db_path = temp.path().join("cookies.db");
+
+    // Relative path to a nonexistent directory/file must resolve against CWD on save.
+    let rel_path = PathBuf::from("./nonexistent-cookie-dir/cookies.txt");
+    let expected_abs = std::path::absolute(&rel_path).unwrap();
+    assert!(expected_abs.is_absolute());
+    assert!(!expected_abs.exists());
+
+    {
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_default_refresh_cookies(Some(&CookieSource::File(rel_path)))
+            .unwrap();
+        assert_eq!(
+            storage.get_default_refresh_cookies().unwrap(),
+            Some(CookieSource::File(expected_abs.clone()))
+        );
+    }
+
+    // Verify raw SQLite value and persisted reload across reopen.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        let stored_value: String = conn
+            .query_row(
+                "SELECT cookie_source_value FROM refresh_preferences WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(stored_value), expected_abs);
+    }
+
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    assert_eq!(
+        storage.get_default_refresh_cookies().unwrap(),
+        Some(CookieSource::File(expected_abs.clone()))
+    );
+
+    // Symlink paths must not be canonicalized when saved.
+    #[cfg(unix)]
+    {
+        let symlink_path = temp.path().join("symlink-cookies.txt");
+        let missing_target = temp.path().join("real-target-does-not-exist.txt");
+        std::os::unix::fs::symlink(&missing_target, &symlink_path).unwrap();
+
+        storage
+            .set_default_refresh_cookies(Some(&CookieSource::File(symlink_path.clone())))
+            .unwrap();
+        assert_eq!(
+            storage.get_default_refresh_cookies().unwrap(),
+            Some(CookieSource::File(symlink_path))
+        );
+
+        // Restore expected_abs as the saved default before testing one-off invocations.
+        storage
+            .set_default_refresh_cookies(Some(&CookieSource::File(expected_abs.clone())))
+            .unwrap();
+    }
+
+    // One-off refresh and download cookie inputs remain unchanged (relative) and leave saved default intact.
+    let refresh = StubRefresh::new();
+    let downloader = StubDownloader::new();
+    let services = AppServices {
+        storage: &storage,
+        refresh_source: &refresh,
+        downloader: &downloader,
+    };
+
+    run_cli(
+        &services,
+        &["siphon", "creator", "add", "https://space.bilibili.com/42"],
+    )
+    .unwrap();
+    run_cli(
+        &services,
+        &["siphon", "refresh", "--cookies", "./oneoff-refresh.txt"],
+    )
+    .unwrap();
+    run_cli(
+        &services,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1test",
+            "--cookies",
+            "./oneoff-download.txt",
+        ],
+    )
+    .unwrap();
+    run_cli(&services, &["siphon", "refresh"]).unwrap();
+
+    let seen_refresh_cookies = refresh.seen_cookies.lock().unwrap().clone();
+    assert_eq!(
+        seen_refresh_cookies,
+        vec![
+            Some(CookieSource::File(PathBuf::from("./oneoff-refresh.txt"))),
+            Some(CookieSource::File(expected_abs.clone())),
+        ]
+    );
+
+    let dl_reqs = downloader.requests.lock().unwrap();
+    assert_eq!(
+        dl_reqs[0].cookies,
+        Some(CookieSource::File(PathBuf::from("./oneoff-download.txt")))
+    );
+    drop(dl_reqs);
+
+    // Saving a relative path via `refresh --save-cookies` stores the resolved absolute path.
+    run_cli(
+        &services,
+        &[
+            "siphon",
+            "refresh",
+            "--cookies",
+            "saved-via-cli/cookies.txt",
+            "--save-cookies",
+        ],
+    )
+    .unwrap();
+    let expected_cli_abs = std::path::absolute(Path::new("saved-via-cli/cookies.txt")).unwrap();
+    assert_eq!(
+        storage.get_default_refresh_cookies().unwrap(),
+        Some(CookieSource::File(expected_cli_abs))
+    );
+}
+
+#[test]
 fn app_services_work_end_to_end_with_sqlite_storage_across_reopen() {
     let temp = TempDir::new("e2e-app");
     let db_path = temp.path().join("app.db");
-    let refresh = StubRefresh;
+    let refresh = StubRefresh::new();
 
     // Session 1: follow creator, save preset & default, save cookies, refresh.
     {

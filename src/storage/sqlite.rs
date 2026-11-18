@@ -982,7 +982,7 @@ fn upload_from_parts(
 
 fn encode_cookie_source(
     source: Option<&CookieSource>,
-) -> Result<(Option<&'static str>, Option<&str>), StorageError> {
+) -> Result<(Option<&'static str>, Option<String>), StorageError> {
     match source {
         None => Ok((None, None)),
         Some(CookieSource::File(path)) => {
@@ -991,7 +991,16 @@ fn encode_cookie_source(
                     "cookie file path cannot be empty".to_owned(),
                 ));
             }
-            let as_str = path.to_str().ok_or_else(|| {
+            // Resolve relative paths against the caller's working directory on save so later
+            // refreshes from other directories target the same file without requiring existence
+            // or symlink canonicalization.
+            let resolved = std::path::absolute(path).map_err(|err| {
+                StorageError::Backend(format!(
+                    "failed to resolve cookie file path '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            let as_str = resolved.into_os_string().into_string().map_err(|_| {
                 StorageError::Backend("cookie file path must be valid UTF-8".to_owned())
             })?;
             Ok((Some("file"), Some(as_str)))
@@ -1002,7 +1011,7 @@ fn encode_cookie_source(
                     "browser profile selector cannot be empty".to_owned(),
                 ));
             }
-            Ok((Some("browser_profile"), Some(spec.as_str())))
+            Ok((Some("browser_profile"), Some(spec.clone())))
         }
     }
 }

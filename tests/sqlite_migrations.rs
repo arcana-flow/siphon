@@ -426,6 +426,11 @@ fn concurrent_open_calls_on_new_database_succeed_cleanly() {
                 start.wait();
                 let storage = SqliteStorage::open(&path).unwrap();
                 assert_eq!(storage.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+                assert_eq!(
+                    storage.get_default_preset().unwrap(),
+                    builtin_video_preset()
+                );
+                assert_eq!(storage.get_default_refresh_cookies().unwrap(), None);
             })
         })
         .collect();

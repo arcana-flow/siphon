@@ -53,7 +53,12 @@ impl SqliteStorage {
             })?;
         }
 
-        let mut conn = Connection::open(path).map_err(map_sqlite_err)?;
+        let mut conn = Connection::open(path).map_err(|err| {
+            StorageError::Backend(format!(
+                "failed to open SQLite database '{}': {err}",
+                path.display()
+            ))
+        })?;
         configure_connection(&conn, true)?;
         migrations::apply(&mut conn)?;
         Ok(Self {
@@ -724,8 +729,10 @@ impl SqliteStorage {
 }
 
 fn configure_connection(conn: &Connection, enable_wal: bool) -> Result<(), StorageError> {
-    conn.busy_timeout(BUSY_TIMEOUT).map_err(map_sqlite_err)?;
-    migrations::retry_sqlite_on_busy(|| {
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(|err| {
+        StorageError::Backend(format!("failed to configure SQLite busy_timeout: {err}"))
+    })?;
+    migrations::retry_sqlite_on_busy("failed to configure SQLite connection pragmas", || {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         if enable_wal {
             let current_mode: String =

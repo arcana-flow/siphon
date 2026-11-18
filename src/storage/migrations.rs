@@ -124,7 +124,9 @@ pub fn apply_migrations(
 ) -> Result<(), StorageError> {
     validate_migration_definitions(migrations)?;
 
-    retry_storage_on_busy(|| apply_migrations_once(conn, migrations))
+    retry_storage_on_busy("failed to apply SQLite schema migrations", || {
+        apply_migrations_once(conn, migrations)
+    })
 }
 
 fn apply_migrations_once(
@@ -159,8 +161,16 @@ fn apply_migrations_once(
 
     let applied_at = Timestamp::now().as_unix_seconds();
     for migration in &migrations[pending_start..] {
-        tx.execute_batch(migration.sql)
-            .map_err(MigrationAttemptError::Sqlite)?;
+        tx.execute_batch(migration.sql).map_err(|err| {
+            if is_sqlite_busy(&err) {
+                MigrationAttemptError::Sqlite(err)
+            } else {
+                MigrationAttemptError::Storage(StorageError::Backend(format!(
+                    "failed to apply migration v{} ('{}'): {err}",
+                    migration.version, migration.name
+                )))
+            }
+        })?;
         tx.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![migration.version, migration.name, applied_at],
@@ -258,14 +268,14 @@ fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-pub(crate) fn retry_sqlite_on_busy<T, F>(mut op: F) -> Result<T, StorageError>
+pub(crate) fn retry_sqlite_on_busy<T, F>(context: &str, mut op: F) -> Result<T, StorageError>
 where
     F: FnMut() -> Result<T, rusqlite::Error>,
 {
-    retry_storage_on_busy(|| op().map_err(MigrationAttemptError::Sqlite))
+    retry_storage_on_busy(context, || op().map_err(MigrationAttemptError::Sqlite))
 }
 
-fn retry_storage_on_busy<T, F>(mut op: F) -> Result<T, StorageError>
+fn retry_storage_on_busy<T, F>(context: &str, mut op: F) -> Result<T, StorageError>
 where
     F: FnMut() -> Result<T, MigrationAttemptError>,
 {
@@ -280,7 +290,9 @@ where
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_millis(50));
             }
-            Err(MigrationAttemptError::Sqlite(err)) => return Err(map_err(err)),
+            Err(MigrationAttemptError::Sqlite(err)) => {
+                return Err(StorageError::Backend(format!("{context}: {err}")));
+            }
             Err(MigrationAttemptError::Storage(err)) => return Err(err),
         }
     }

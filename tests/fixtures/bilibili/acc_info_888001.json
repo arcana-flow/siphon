@@ -1,0 +1,12 @@
+{
+  "code": 0,
+  "message": "0",
+  "ttl": 1,
+  "data": {
+    "mid": 888001,
+    "name": "Sanitized Creator Beta",
+    "sex": "保密",
+    "face": "https://i0.hdslb.com/bfs/face/sanitized-beta.jpg",
+    "sign": "Sanitized test fixture beta"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "code": 0,
+  "message": "0",
+  "ttl": 1,
+  "data": {
+    "list": {
+      "vlist": [
+        {
+          "aid": 10001,
+          "bvid": "BV1san000001",
+          "title": "Sanitized Upload 1",
+          "created": 1700000500
+        }
+      ]
+    },
+    "page": {
+      "pn": 3,
+      "ps": 2,
+      "count": 5
+    }
+  }
+}

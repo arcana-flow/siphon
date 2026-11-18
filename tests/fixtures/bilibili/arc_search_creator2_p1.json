@@ -1,0 +1,22 @@
+{
+  "code": 0,
+  "message": "0",
+  "ttl": 1,
+  "data": {
+    "list": {
+      "vlist": [
+        {
+          "aid": 20001,
+          "bvid": "BV1beta00001",
+          "title": "Beta Creator Upload 1",
+          "created": 1700001800
+        }
+      ]
+    },
+    "page": {
+      "pn": 1,
+      "ps": 2,
+      "count": 1
+    }
+  }
+}

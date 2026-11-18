@@ -1,0 +1,22 @@
+{
+  "version": 4,
+  "lastUserContextId": 2,
+  "identities": [
+    {
+      "userContextId": 1,
+      "public": true,
+      "icon": "fingerprint",
+      "color": "blue",
+      "l10nId": "user-context-personal",
+      "name": "Personal"
+    },
+    {
+      "userContextId": 2,
+      "public": true,
+      "icon": "briefcase",
+      "color": "orange",
+      "l10nId": "user-context-work",
+      "name": "Work"
+    }
+  ]
+}

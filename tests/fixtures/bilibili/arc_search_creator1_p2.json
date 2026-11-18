@@ -1,0 +1,28 @@
+{
+  "code": 0,
+  "message": "0",
+  "ttl": 1,
+  "data": {
+    "list": {
+      "vlist": [
+        {
+          "aid": 10003,
+          "bvid": "BV1san000003",
+          "title": "Sanitized Upload 3",
+          "created": 1700001200
+        },
+        {
+          "aid": 10002,
+          "bvid": "BV1san000002",
+          "title": "Sanitized Upload 2 (Follow Boundary)",
+          "created": 1700001000
+        }
+      ]
+    },
+    "page": {
+      "pn": 2,
+      "ps": 2,
+      "count": 5
+    }
+  }
+}

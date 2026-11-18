@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use crate::cli::{Cli, Command, CreatorCommand, PresetCommand, UploadCommand};
 use crate::domain::Timestamp;
 use crate::download::execute_download;
-use crate::error::AppError;
+use crate::error::{AppError, DownloadError};
 use crate::refresh::{CreatorRefreshOutcome, RefreshSummary, follow_creator, refresh_creators};
 use crate::storage::Storage;
 
@@ -187,9 +187,34 @@ fn execute_download_command(
 ) -> Result<CommandOutput, AppError> {
     let plan = args.to_plan_input()?;
     let report = execute_download(services.storage, services.downloader, plan)?;
+    if !report.outcome.succeeded {
+        let message = match &report.request.target {
+            crate::download::DownloadTarget::DirectUrl { url } => {
+                format!("downloader reported an unsuccessful outcome for {url}")
+            }
+            crate::download::DownloadTarget::PendingUpload { upload } => {
+                format!(
+                    "downloader reported an unsuccessful outcome for upload {} ({}); status remains {}",
+                    upload.id, upload.title, upload.status
+                )
+            }
+        };
+        return Err(AppError::Download(DownloadError::ProcessFailed {
+            exit_code: Some(1),
+            stderr: message,
+        }));
+    }
+
     let status_note = match &report.request.target {
         crate::download::DownloadTarget::DirectUrl { url } => {
-            format!("Downloaded direct URL {url}")
+            if report.outcome.confirmed_artifacts.is_empty() {
+                format!("Finished direct URL {url} without confirmed output artifact")
+            } else {
+                format!(
+                    "Downloaded direct URL {url} ({} artifact(s) confirmed)",
+                    report.outcome.confirmed_artifacts.len()
+                )
+            }
         }
         crate::download::DownloadTarget::PendingUpload { upload } => {
             if report.marked_downloaded {

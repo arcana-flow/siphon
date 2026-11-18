@@ -846,7 +846,65 @@ fn download_status_updates_only_on_confirmed_upload_artifact() {
         refresh_source: &refresh,
         downloader: &ok_downloader,
     };
-    run_cmd(&ok_services, &["siphon", "download", &upload_url]).unwrap();
+    let direct_ok = run_cmd(&ok_services, &["siphon", "download", &upload_url]).unwrap();
+    assert!(direct_ok.contains("Downloaded direct URL"));
+    assert!(direct_ok.contains("1 artifact(s) confirmed"));
+    assert_eq!(
+        storage.get_upload(upload_id).unwrap().status,
+        UploadStatus::Pending
+    );
+
+    // Direct URL simulation / run without confirmed artifacts uses neutral completion message.
+    let direct_sim = run_cmd(
+        &sim_services,
+        &["siphon", "download", &upload_url, "--", "--simulate"],
+    )
+    .unwrap();
+    assert!(!direct_sim.to_ascii_lowercase().contains("downloaded"));
+    assert!(direct_sim.contains("without confirmed output artifact"));
+    assert_eq!(
+        storage.get_upload(upload_id).unwrap().status,
+        UploadStatus::Pending
+    );
+
+    // Ok(DownloadOutcome { succeeded: false, ... }) surfaces as nonzero AppError for direct & upload runs.
+    let unsuccessful_direct = StubDownloader {
+        requests: Mutex::new(Vec::new()),
+        outcome: Ok(DownloadOutcome {
+            succeeded: false,
+            confirmed_artifacts: Vec::new(),
+        }),
+    };
+    let unsuccessful_direct_services = AppServices {
+        storage: &storage,
+        refresh_source: &refresh,
+        downloader: &unsuccessful_direct,
+    };
+    let direct_unsuccessful_err = run_cmd(
+        &unsuccessful_direct_services,
+        &["siphon", "download", &upload_url],
+    )
+    .unwrap_err();
+    assert!(matches!(direct_unsuccessful_err, AppError::Download(_)));
+
+    let unsuccessful_with_artifact = StubDownloader {
+        requests: Mutex::new(Vec::new()),
+        outcome: Ok(DownloadOutcome {
+            succeeded: false,
+            confirmed_artifacts: vec![PathBuf::from("partial.mp4")],
+        }),
+    };
+    let unsuccessful_upload_services = AppServices {
+        storage: &storage,
+        refresh_source: &refresh,
+        downloader: &unsuccessful_with_artifact,
+    };
+    let upload_unsuccessful_err = run_cmd(
+        &unsuccessful_upload_services,
+        &["siphon", "download", "--upload", &upload_id.to_string()],
+    )
+    .unwrap_err();
+    assert!(matches!(upload_unsuccessful_err, AppError::Download(_)));
     assert_eq!(
         storage.get_upload(upload_id).unwrap().status,
         UploadStatus::Pending

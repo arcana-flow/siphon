@@ -7,4 +7,5 @@ readme = "README.md"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 thiserror = "2.0"

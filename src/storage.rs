@@ -1,5 +1,10 @@
 //! Stable storage integration contract for Siphon's local SQLite persistence.
 
+pub mod migrations;
+pub mod sqlite;
+
+pub use sqlite::SqliteStorage;
+
 use crate::domain::{
     CookieSource, Creator, CreatorId, DiscoveredUpload, DownloadPreset, FollowId, FollowedCreator,
     Platform, PresetName, PresetSummary, Timestamp, Upload, UploadId,

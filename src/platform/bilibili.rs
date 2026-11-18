@@ -22,7 +22,8 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/53
 const DEFAULT_PAGE_SIZE: u32 = 30;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_WBI_CACHE_TTL: Duration = Duration::from_secs(600);
-const MAX_PAGINATION_PAGES: u32 = 10_000;
+const DEFAULT_MAX_PAGINATION_PAGES: u32 = 10_000;
+const MAX_CONSECUTIVE_DUPLICATE_PAGES: u32 = 3;
 
 // Default WebGL fingerprint values expected by Bilibili space WBI endpoints.
 const DEFAULT_DM_IMG_LIST: &str = "[]";
@@ -47,6 +48,8 @@ pub struct BilibiliClientConfig {
     pub user_agent: String,
     /// Number of uploads requested per page (`ps` parameter).
     pub page_size: u32,
+    /// Maximum number of upload pages fetched in one refresh before failing.
+    pub max_pages: u32,
     /// Global timeout for each HTTP request.
     pub request_timeout: Duration,
     /// How long fetched WBI signing keys remain cached in memory.
@@ -63,6 +66,7 @@ impl Default for BilibiliClientConfig {
             cookie_target_url: DEFAULT_COOKIE_TARGET_URL.to_owned(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             page_size: DEFAULT_PAGE_SIZE,
+            max_pages: DEFAULT_MAX_PAGINATION_PAGES,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             wbi_cache_ttl: DEFAULT_WBI_CACHE_TTL,
             fetch_guest_buvid: true,
@@ -83,6 +87,13 @@ impl BilibiliClientConfig {
     #[must_use]
     pub fn with_page_size(mut self, page_size: u32) -> Self {
         self.page_size = page_size.clamp(1, 50);
+        self
+    }
+
+    /// Overrides the maximum number of pages fetched per refresh (clamped to `>= 1`).
+    #[must_use]
+    pub fn with_max_pages(mut self, max_pages: u32) -> Self {
+        self.max_pages = max_pages.max(1);
         self
     }
 
@@ -135,6 +146,9 @@ impl BilibiliRefreshSource {
         config.api_base_url = config.api_base_url.trim_end_matches('/').to_owned();
         if config.page_size == 0 {
             config.page_size = DEFAULT_PAGE_SIZE;
+        }
+        if config.max_pages == 0 {
+            config.max_pages = DEFAULT_MAX_PAGINATION_PAGES;
         }
         let agent_config = ureq::Agent::config_builder()
             .timeout_global(Some(config.request_timeout))
@@ -346,8 +360,11 @@ impl BilibiliRefreshSource {
 
         let mut uploads = Vec::new();
         let mut seen_ids = HashSet::new();
+        let max_pages = self.config.max_pages.max(1);
+        let mut consecutive_duplicate_pages = 0u32;
+        let mut completed = false;
 
-        for pn in 1..=MAX_PAGINATION_PAGES {
+        for pn in 1..=max_pages {
             let pn_str = pn.to_string();
             let params = [
                 ("mid", mid_str.as_str()),
@@ -380,13 +397,18 @@ impl BilibiliRefreshSource {
                     "Bilibili arc/search response returned code 0 without data".to_owned(),
                 )
             })?;
-            let vlist = data.list.map(|l| l.vlist).unwrap_or_default();
+            let list = data.list.ok_or_else(|| {
+                RefreshError::PlatformResponse(
+                    "Bilibili arc/search response returned code 0 without list".to_owned(),
+                )
+            })?;
+            let vlist = list.vlist;
             if vlist.is_empty() {
+                completed = true;
                 break;
             }
 
             let mut page_had_unseen = false;
-            let mut last_crossed_boundary = false;
 
             for item in &vlist {
                 let published_at = Timestamp::from_unix_seconds(item.created);
@@ -410,13 +432,12 @@ impl BilibiliRefreshSource {
                 }
             }
 
-            if let Some(last) = vlist.last() {
+            let last_crossed_boundary = vlist.last().is_some_and(|last| {
                 let last_ts = Timestamp::from_unix_seconds(last.created);
-                last_crossed_boundary =
-                    past_pagination_boundary(last_ts, followed_at, checkpoint, replay_checkpoint);
-            }
-
-            if last_crossed_boundary || !page_had_unseen {
+                past_pagination_boundary(last_ts, followed_at, checkpoint, replay_checkpoint)
+            });
+            if last_crossed_boundary {
+                completed = true;
                 break;
             }
 
@@ -427,8 +448,26 @@ impl BilibiliRefreshSource {
                 _ => vlist.len() < ps as usize,
             };
             if reached_total {
+                completed = true;
                 break;
             }
+
+            if page_had_unseen {
+                consecutive_duplicate_pages = 0;
+            } else {
+                consecutive_duplicate_pages += 1;
+                if consecutive_duplicate_pages >= MAX_CONSECUTIVE_DUPLICATE_PAGES {
+                    return Err(RefreshError::PlatformResponse(format!(
+                        "Bilibili pagination stalled after {consecutive_duplicate_pages} consecutive duplicate page(s) before reaching checkpoint or end of feed"
+                    )));
+                }
+            }
+        }
+
+        if !completed {
+            return Err(RefreshError::PlatformResponse(format!(
+                "Bilibili pagination exceeded limit of {max_pages} page(s) before reaching checkpoint or end of feed"
+            )));
         }
 
         let max_discovered = uploads
@@ -806,7 +845,7 @@ struct ArcSearchData {
 
 #[derive(Debug, Deserialize)]
 struct ArcSearchList {
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(deserialize_with = "deserialize_null_default")]
     vlist: Vec<ArcVideoItem>,
 }
 

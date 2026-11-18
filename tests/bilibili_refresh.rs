@@ -1523,3 +1523,214 @@ fn guest_buvid3_spi_and_wbi_cache_rotation_recovery() {
         Some("buvid3=GUEST-BUVID3-999")
     );
 }
+
+#[test]
+fn pagination_cap_exhaustion_fails_without_committing_uploads_or_checkpoint() {
+    let nav_json = read_fixture("bilibili/nav_guest.json");
+    let p1 = read_fixture("bilibili/arc_search_creator1_p1.json");
+    let p2 = read_fixture("bilibili/arc_search_creator1_p2.json");
+    let p3 = read_fixture("bilibili/arc_search_creator1_p3.json");
+
+    let server = MockBilibiliServer::start(move |req| match req.path.as_str() {
+        "/x/web-interface/nav" => MockHttpResponse::ok_json(&nav_json),
+        "/x/space/wbi/arc/search" => match req.query.get("pn").map(String::as_str) {
+            Some("1") => MockHttpResponse::ok_json(&p1),
+            Some("2") => MockHttpResponse::ok_json(&p2),
+            Some("3") => MockHttpResponse::ok_json(&p3),
+            _ => MockHttpResponse::status(404, "unexpected page"),
+        },
+        _ => MockHttpResponse::status(404, "unknown"),
+    });
+
+    // Creator followed at 1_700_000_000 needs all 3 pages (`count = 5`),
+    // so max_pages = 2 cannot reach boundary or total and must fail atomically.
+    let storage = TestStorage::new();
+    let initial_cp = Timestamp::from_unix_seconds(1_700_000_000);
+    let followed = storage.follow_at("946974", "Sanitized Creator Alpha", initial_cp);
+    let client = BilibiliRefreshSource::with_config(
+        BilibiliClientConfig::default()
+            .with_api_base_url(server.base_url())
+            .with_page_size(2)
+            .with_max_pages(2)
+            .with_guest_buvid(false),
+    );
+
+    let summary = refresh_creators(
+        &storage,
+        &client,
+        Some(followed.creator.id),
+        RefreshCookiePolicy::UseSavedDefault,
+    )
+    .unwrap();
+    let err = summary.check_failures().unwrap_err();
+    match err {
+        AppError::RefreshPartialFailure {
+            succeeded,
+            failures,
+        } => {
+            assert_eq!(succeeded, 0);
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0].error.contains("exceeded limit of 2 page(s)"));
+        }
+        other => panic!("expected RefreshPartialFailure, got {other:?}"),
+    }
+
+    assert!(storage.all_uploads().is_empty());
+    assert_eq!(
+        storage
+            .get_followed_creator(followed.creator.id)
+            .unwrap()
+            .follow
+            .refresh_checkpoint,
+        initial_cp
+    );
+}
+
+#[test]
+fn duplicate_page_handling_recovers_single_shift_and_fails_on_stuck_pagination() {
+    let nav_json = read_fixture("bilibili/nav_guest.json");
+    let p1 = read_fixture("bilibili/arc_search_creator1_p1.json");
+    let p2_boundary = read_fixture("bilibili/arc_search_creator1_p2.json");
+
+    // Case 1: Single duplicate page due to concurrent upload shift before pn=2 (`pn=2` repeats `p1`),
+    // followed by `pn=3` which crosses the boundary at 1_700_001_000. Must still discover pn=3!
+    let p1_shift = p1.clone();
+    let p2_shift = p2_boundary.clone();
+    let nav_shift = nav_json.clone();
+    let shifted_server = MockBilibiliServer::start(move |req| match req.path.as_str() {
+        "/x/web-interface/nav" => MockHttpResponse::ok_json(&nav_shift),
+        "/x/space/wbi/arc/search" => match req.query.get("pn").map(String::as_str) {
+            Some("1") | Some("2") => MockHttpResponse::ok_json(&p1_shift),
+            Some("3") => MockHttpResponse::ok_json(&p2_shift),
+            _ => MockHttpResponse::status(404, "unexpected page"),
+        },
+        _ => MockHttpResponse::status(404, "unknown"),
+    });
+
+    let storage_ok = TestStorage::new();
+    let c_ok = storage_ok.follow_at(
+        "946974",
+        "Sanitized Creator Alpha",
+        Timestamp::from_unix_seconds(1_700_001_000),
+    );
+    let client_ok = shifted_server.client(2);
+    refresh_creators(
+        &storage_ok,
+        &client_ok,
+        Some(c_ok.creator.id),
+        RefreshCookiePolicy::UseSavedDefault,
+    )
+    .unwrap()
+    .check_failures()
+    .unwrap();
+    let ok_ids: Vec<String> = storage_ok
+        .list_pending_uploads()
+        .unwrap()
+        .into_iter()
+        .map(|u| u.platform_upload_id)
+        .collect();
+    assert_eq!(ok_ids, vec!["BV1san000005", "BV1san000004", "BV1san000003"]);
+
+    // Case 2: Stuck server keeps repeating page 1 indefinitely (`count = 20`) without crossing boundary.
+    // Must fail rather than returning Ok and losing remaining pages.
+    let p1_stuck = p1.replace("\"count\": 5", "\"count\": 20");
+    let stuck_server = MockBilibiliServer::start(move |req| match req.path.as_str() {
+        "/x/web-interface/nav" => MockHttpResponse::ok_json(&nav_json),
+        "/x/space/wbi/arc/search" => MockHttpResponse::ok_json(&p1_stuck),
+        _ => MockHttpResponse::status(404, "unknown"),
+    });
+
+    let storage_stuck = TestStorage::new();
+    let initial_cp = Timestamp::from_unix_seconds(1_700_000_000);
+    let c_stuck = storage_stuck.follow_at("946974", "Sanitized Creator Alpha", initial_cp);
+    let client_stuck = BilibiliRefreshSource::with_config(
+        BilibiliClientConfig::default()
+            .with_api_base_url(stuck_server.base_url())
+            .with_page_size(2)
+            .with_max_pages(20)
+            .with_guest_buvid(false),
+    );
+
+    let err = refresh_creators(
+        &storage_stuck,
+        &client_stuck,
+        Some(c_stuck.creator.id),
+        RefreshCookiePolicy::UseSavedDefault,
+    )
+    .unwrap()
+    .check_failures()
+    .unwrap_err();
+    match err {
+        AppError::RefreshPartialFailure {
+            succeeded,
+            failures,
+        } => {
+            assert_eq!(succeeded, 0);
+            assert!(failures[0].error.contains("pagination stalled"));
+        }
+        other => panic!("expected stalled pagination error, got {other:?}"),
+    }
+    assert!(storage_stuck.all_uploads().is_empty());
+    assert_eq!(
+        storage_stuck
+            .get_followed_creator(c_stuck.creator.id)
+            .unwrap()
+            .follow
+            .refresh_checkpoint,
+        initial_cp
+    );
+}
+
+#[test]
+fn code_zero_without_list_fails_as_malformed_response_and_preserves_checkpoint() {
+    let nav_json = read_fixture("bilibili/nav_guest.json");
+    let mode = Arc::new(Mutex::new("missing_list"));
+    let mode_clone = Arc::clone(&mode);
+
+    let server = MockBilibiliServer::start(move |req| match req.path.as_str() {
+        "/x/web-interface/nav" => MockHttpResponse::ok_json(&nav_json),
+        "/x/space/wbi/arc/search" => match *mode_clone.lock().unwrap() {
+            "missing_list" => {
+                MockHttpResponse::ok_json(r#"{"code":0,"message":"0","data":{"page":{"count":0}}}"#)
+            }
+            "null_list" => MockHttpResponse::ok_json(
+                r#"{"code":0,"message":"0","data":{"list":null,"page":{"count":0}}}"#,
+            ),
+            _ => MockHttpResponse::ok_json(
+                r#"{"code":0,"message":"0","data":{"list":{},"page":{"count":0}}}"#,
+            ),
+        },
+        _ => MockHttpResponse::status(404, "unknown"),
+    });
+
+    let storage = TestStorage::new();
+    let initial_cp = Timestamp::from_unix_seconds(1_700_000_000);
+    let followed = storage.follow_at("946974", "Sanitized Creator Alpha", initial_cp);
+    let client = server.client(30);
+
+    for case in ["missing_list", "null_list", "missing_vlist"] {
+        *mode.lock().unwrap() = case;
+        let err = refresh_creators(
+            &storage,
+            &client,
+            Some(followed.creator.id),
+            RefreshCookiePolicy::UseSavedDefault,
+        )
+        .unwrap()
+        .check_failures()
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::RefreshPartialFailure { succeeded: 0, .. }
+        ));
+        assert!(storage.all_uploads().is_empty());
+        assert_eq!(
+            storage
+                .get_followed_creator(followed.creator.id)
+                .unwrap()
+                .follow
+                .refresh_checkpoint,
+            initial_cp
+        );
+    }
+}

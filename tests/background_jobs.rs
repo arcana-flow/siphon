@@ -278,6 +278,8 @@ impl CliRunner {
             "SIPHON_STUB_STDOUT_PROGRESS",
             "SIPHON_STUB_PROGRESS_BYTES",
             "SIPHON_STUB_READY_FILE",
+            "SIPHON_STUB_PID_FILE",
+            "SIPHON_STUB_READ_STDIN_EXPECT",
             "SIPHON_STUB_WAIT_FILE",
             "SIPHON_STUB_POST_READY_FILE",
             "SIPHON_STUB_POST_WAIT_FILE",
@@ -2119,4 +2121,423 @@ fn main() -> ExitCode {
         Timestamp::from_unix_seconds(base_ts + 20).format_utc_iso()
     );
     assert_eq!(creator_outcome["new_uploads_inserted"], 0);
+}
+
+#[cfg(unix)]
+mod unix_pty_support {
+    use core::ffi::{c_char, c_int, c_ulong, c_void};
+    use std::fs::File;
+    use std::io::{self, Read};
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    const F_SETFD: c_int = 2;
+    const FD_CLOEXEC: c_int = 1;
+    const ESRCH: i32 = 3;
+
+    #[cfg(target_os = "linux")]
+    const TIOCSCTTY: c_ulong = 0x540E;
+    #[cfg(target_os = "macos")]
+    const TIOCSCTTY: c_ulong = 0x2000_7461;
+
+    unsafe extern "C" {
+        fn openpty(
+            amaster: *mut c_int,
+            aslave: *mut c_int,
+            name: *mut c_char,
+            termp: *const c_void,
+            winp: *const c_void,
+        ) -> c_int;
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        fn setsid() -> c_int;
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+        fn tcsetpgrp(fd: c_int, pgrp: c_int) -> c_int;
+        fn getpgrp() -> c_int;
+        fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    pub fn spawn_under_pty(mut cmd: Command) -> (Child, File, JoinHandle<Vec<u8>>) {
+        let mut master_raw: c_int = -1;
+        let mut slave_raw: c_int = -1;
+        // SAFETY: `openpty` initializes two valid PTY file descriptors when returning `0`.
+        assert_eq!(
+            unsafe {
+                openpty(
+                    &mut master_raw,
+                    &mut slave_raw,
+                    core::ptr::null_mut(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                )
+            },
+            0,
+            "openpty failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: newly allocated descriptors from `openpty`.
+        let master_fd = unsafe { OwnedFd::from_raw_fd(master_raw) };
+        let slave_fd = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+
+        for fd in [master_fd.as_raw_fd(), slave_fd.as_raw_fd()] {
+            // SAFETY: set close-on-exec so only `dup2`'d `0/1/2` cross `exec` into child.
+            assert_eq!(
+                unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) },
+                0,
+                "fcntl FD_CLOEXEC failed: {}",
+                io::Error::last_os_error()
+            );
+        }
+
+        let slave_raw = slave_fd.as_raw_fd();
+        // SAFETY: `pre_exec` runs between `fork` and `exec` inside the child process.
+        unsafe {
+            cmd.pre_exec(move || {
+                if setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if ioctl(slave_raw, TIOCSCTTY, 0 as c_int) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                let pgrp = getpgrp();
+                if tcsetpgrp(slave_raw, pgrp) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if dup2(slave_raw, 0) == -1 || dup2(slave_raw, 1) == -1 || dup2(slave_raw, 2) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn().expect("spawn CLI process attached to PTY");
+        drop(slave_fd);
+
+        let master_writer = File::from(master_fd);
+        let mut master_reader = master_writer.try_clone().expect("clone PTY master");
+        let drain_handle = thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = master_reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        });
+
+        (child, master_writer, drain_handle)
+    }
+
+    pub fn wait_child_bounded(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("poll child status") {
+                return status;
+            }
+            if start.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out after {timeout:?} waiting for PTY child exit");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn wait_pid_gone(pid: u32, timeout: Duration) {
+        let raw = i32::try_from(pid).expect("positive pid");
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            // SAFETY: `kill(raw, 0)` checks existence without sending a signal.
+            let rc = unsafe { kill(raw, 0) };
+            if rc == -1 && io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process {pid} stayed alive longer than {timeout:?}");
+    }
+}
+
+fn seed_single_upload_runner(
+    work_dir: PathBuf,
+    db_path: PathBuf,
+    bvid: &'static str,
+    title: &'static str,
+) -> (CliRunner, MockBilibiliServer) {
+    let nav_json = read_fixture("bilibili/nav_guest.json");
+    let acc_json = read_fixture("bilibili/acc_info_946974.json");
+    let spi_json = r#"{"code":0,"message":"0","data":{"b_3":"BUVID3","b_4":"BUVID4"}}"#;
+    let feed_ts = Timestamp::now().as_unix_seconds() + 100;
+    let server = MockBilibiliServer::start(move |req| match req.path.as_str() {
+        "/x/frontend/finger/spi" => MockHttpResponse::ok_json(spi_json),
+        "/x/web-interface/nav" => MockHttpResponse::ok_json(&nav_json),
+        "/x/space/wbi/acc/info" => MockHttpResponse::ok_json(&acc_json),
+        "/x/space/wbi/arc/search" => {
+            MockHttpResponse::ok_json(arc_search_json(&[(bvid, 1001, title, feed_ts)]))
+        }
+        _ => MockHttpResponse::status(404, "unknown"),
+    });
+    let runner = CliRunner::new(work_dir, db_path, server.base_url());
+    assert!(
+        runner
+            .run_with_db(&[
+                "--json",
+                "creator",
+                "add",
+                "https://space.bilibili.com/946974",
+            ])
+            .status
+            .success()
+    );
+    assert!(runner.run_with_db(&["--json", "refresh"]).status.success());
+    (runner, server)
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_managed_upload_preserves_tty_read_without_sigttin() {
+    let temp = TempDir::new().unwrap();
+    let work_dir = temp.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = temp.path().join("siphon.db");
+    let (runner, _server) =
+        seed_single_upload_runner(work_dir, db_path, "BV1ptyread", "PTY Read Video");
+
+    let ready_file = temp.path().join("pty_read.ready");
+    let cmd = runner.command_with_db(
+        &["download", "--upload", "1", "--no-preset"],
+        &[
+            ("SIPHON_STUB_READY_FILE", ready_file.to_str().unwrap()),
+            ("SIPHON_STUB_READ_STDIN_EXPECT", "confirm"),
+        ],
+    );
+    let (mut child, mut master, drain) = unix_pty_support::spawn_under_pty(cmd);
+    wait_for_file(&ready_file, Duration::from_secs(10));
+    master.write_all(b"confirm\n").unwrap();
+    master.flush().unwrap();
+
+    let status = unix_pty_support::wait_child_bounded(&mut child, Duration::from_secs(10));
+    drop(master);
+    let pty_output = drain.join().unwrap();
+    assert!(
+        status.success(),
+        "foreground download under PTY failed (status={status:?}): {}",
+        String::from_utf8_lossy(&pty_output)
+    );
+
+    let pending = parse_single_json_stdout(&runner.run_with_db(&["--json", "upload", "list"]));
+    assert_eq!(pending["data"]["uploads"].as_array().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_managed_upload_receives_pty_ctrl_c() {
+    let temp = TempDir::new().unwrap();
+    let work_dir = temp.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = temp.path().join("siphon.db");
+    let (runner, _server) =
+        seed_single_upload_runner(work_dir, db_path, "BV1ptyctrlc", "PTY CtrlC Video");
+
+    let ready_file = temp.path().join("pty_ctrlc.ready");
+    let pid_file = temp.path().join("pty_ctrlc.pid");
+    let wait_file = temp.path().join("pty_ctrlc.wait");
+    fs::write(&wait_file, b"1").unwrap();
+
+    let cmd = runner.command_with_db(
+        &["download", "--upload", "1", "--no-preset"],
+        &[
+            ("SIPHON_STUB_PID_FILE", pid_file.to_str().unwrap()),
+            ("SIPHON_STUB_READY_FILE", ready_file.to_str().unwrap()),
+            ("SIPHON_STUB_WAIT_FILE", wait_file.to_str().unwrap()),
+        ],
+    );
+    let (mut child, mut master, drain) = unix_pty_support::spawn_under_pty(cmd);
+    wait_for_file(&ready_file, Duration::from_secs(10));
+    let stub_pid: u32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("stub pid");
+
+    // Send Ctrl-C (`VINTR`) on the controlling PTY; both `siphon` and `yt-dlp-stub` must
+    // belong to the foreground process group and terminate immediately.
+    master.write_all(&[0x03]).unwrap();
+    master.flush().unwrap();
+
+    let status = unix_pty_support::wait_child_bounded(&mut child, Duration::from_secs(5));
+    assert!(!status.success(), "Ctrl-C should interrupt download");
+    unix_pty_support::wait_pid_gone(stub_pid, Duration::from_secs(3));
+    drop(master);
+    let _ = drain.join();
+    let _ = fs::remove_file(&wait_file);
+
+    // Slot was cleanly released and a subsequent download succeeds.
+    let retry = runner.run_with_db(&["--json", "download", "--upload", "1", "--no-preset"]);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let retry_json = parse_single_json_stdout(&retry);
+    assert_eq!(retry_json["data"]["marked_downloaded"], true);
+}
+
+#[test]
+fn reconciliation_tracks_child_across_database_path_aliases() {
+    let temp = TempDir::new().unwrap();
+    let real_dir = temp.path().join("real");
+    let nested_dir = real_dir.join("nested");
+    let work_dir = temp.path().join("work");
+    fs::create_dir_all(&nested_dir).unwrap();
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = real_dir.join("siphon.db");
+
+    let (runner_real, server) = seed_single_upload_runner(
+        work_dir.clone(),
+        db_path,
+        "BV1alias1",
+        "Alias Tracked Video",
+    );
+
+    #[cfg(unix)]
+    let alias_db = {
+        let symlink_dir = temp.path().join("symlink_dir");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+        symlink_dir.join("siphon.db")
+    };
+    #[cfg(windows)]
+    let alias_db = nested_dir.join("..").join("SIPHON.DB");
+    #[cfg(not(any(unix, windows)))]
+    let alias_db = nested_dir.join("..").join("siphon.db");
+
+    let runner_alias = CliRunner::new(work_dir, alias_db, server.base_url());
+    let ready = temp.path().join("alias.ready");
+    let wait = temp.path().join("alias.wait");
+    fs::write(&wait, b"1").unwrap();
+
+    let started = parse_single_json_stdout(&runner_alias.run_with_db_in_dir(
+        &runner_alias.work_dir,
+        &[
+            "--json",
+            "download",
+            "--background",
+            "--upload",
+            "1",
+            "--no-preset",
+        ],
+        &[
+            ("SIPHON_STUB_READY_FILE", ready.to_str().unwrap()),
+            ("SIPHON_STUB_WAIT_FILE", wait.to_str().unwrap()),
+        ],
+    ));
+    let job_id = started["data"]["id"].as_i64().unwrap();
+    let worker_pid = started["data"]["pid"].as_u64().unwrap() as u32;
+    wait_for_file(&ready, Duration::from_secs(10));
+
+    kill_process_by_pid(worker_pid);
+
+    // Status and contention lookups via the primary DB path see the canonical child marker written
+    // through the alias DB path.
+    #[cfg(unix)]
+    {
+        let status = parse_single_json_stdout(&runner_real.run_with_db(&[
+            "--json",
+            "job",
+            "status",
+            &job_id.to_string(),
+        ]));
+        assert_eq!(status["data"]["state"], "running");
+
+        let busy = runner_real.run_with_db(&["--json", "download", "--upload", "1", "--no-preset"]);
+        assert_eq!(busy.status.code(), Some(1));
+        assert_eq!(
+            parse_single_json_stdout(&busy)["error"]["code"],
+            "operation_busy"
+        );
+        fs::remove_file(&wait).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let _ = fs::remove_file(&wait);
+    }
+
+    let final_status = poll_job_until(&runner_real, job_id, Duration::from_secs(10), |d| {
+        d["state"] != "running"
+    });
+    assert_eq!(final_status["state"], "interrupted");
+}
+
+#[test]
+fn managed_downloads_fail_closed_without_executing_child_when_tracking_fails() {
+    let temp = TempDir::new().unwrap();
+    let work_dir = temp.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = temp.path().join("siphon.db");
+    let (runner, _server) = seed_single_upload_runner(
+        work_dir,
+        db_path.clone(),
+        "BV1failclosed",
+        "Fail Closed Video",
+    );
+
+    let canonical_db = fs::canonicalize(&db_path).unwrap();
+    let mut owners_os = canonical_db.as_os_str().to_os_string();
+    owners_os.push(".owners");
+    let blocked_owners = PathBuf::from(owners_os);
+    fs::write(&blocked_owners, b"block-owners-directory").unwrap();
+
+    // Foreground managed upload fails closed before `yt-dlp-stub` runs and releases the slot.
+    let fg_ready = temp.path().join("fg_fail_closed.ready");
+    let fg_out = runner.run_with_db_in_dir(
+        &runner.work_dir,
+        &["--json", "download", "--upload", "1", "--no-preset"],
+        &[("SIPHON_STUB_READY_FILE", fg_ready.to_str().unwrap())],
+    );
+    assert_eq!(fg_out.status.code(), Some(1));
+    assert!(
+        !fg_ready.exists(),
+        "foreground child should never execute when tracking setup fails"
+    );
+
+    // Background managed download also fails closed, finalizes job `failed`, and releases slot.
+    let bg_ready = temp.path().join("bg_fail_closed.ready");
+    let bg_sub = parse_single_json_stdout(&runner.run_with_db_in_dir(
+        &runner.work_dir,
+        &[
+            "--json",
+            "download",
+            "--background",
+            "--upload",
+            "1",
+            "--no-preset",
+        ],
+        &[("SIPHON_STUB_READY_FILE", bg_ready.to_str().unwrap())],
+    ));
+    let bg_id = bg_sub["data"]["id"].as_i64().unwrap();
+    let bg_done = poll_job_until(&runner, bg_id, Duration::from_secs(10), |d| {
+        d["state"] != "running"
+    });
+    assert_eq!(bg_done["state"], "failed");
+    assert!(
+        !bg_ready.exists(),
+        "background child should never execute when tracking setup fails"
+    );
+
+    // Removing the obstruction allows subsequent downloads on upload 1 without a stuck slot.
+    fs::remove_file(&blocked_owners).unwrap();
+    let retry = runner.run_with_db(&["--json", "download", "--upload", "1", "--no-preset"]);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let retry_json = parse_single_json_stdout(&retry);
+    assert_eq!(retry_json["data"]["marked_downloaded"], true);
 }

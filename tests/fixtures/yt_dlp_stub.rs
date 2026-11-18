@@ -118,6 +118,8 @@ fn load_stub_settings() -> HashMap<String, String> {
         "SIPHON_STUB_STDOUT_PROGRESS",
         "SIPHON_STUB_PROGRESS_BYTES",
         "SIPHON_STUB_READY_FILE",
+        "SIPHON_STUB_PID_FILE",
+        "SIPHON_STUB_READ_STDIN_EXPECT",
         "SIPHON_STUB_WAIT_FILE",
         "SIPHON_STUB_POST_READY_FILE",
         "SIPHON_STUB_POST_WAIT_FILE",
@@ -711,11 +713,36 @@ fn main() -> ExitCode {
         let _ = io::stdout().flush();
     }
 
+    if let Some(pid_path) = settings
+        .get("SIPHON_STUB_PID_FILE")
+        .filter(|s| !s.is_empty())
+    {
+        write_artifact(
+            Path::new(pid_path),
+            std::process::id().to_string().as_bytes(),
+        );
+    }
+
     if let Some(ready_path) = settings
         .get("SIPHON_STUB_READY_FILE")
         .filter(|s| !s.is_empty())
     {
         write_artifact(Path::new(ready_path), b"ready");
+    }
+
+    if let Some(expected_stdin) = settings
+        .get("SIPHON_STUB_READ_STDIN_EXPECT")
+        .filter(|s| !s.is_empty())
+    {
+        let mut line = String::new();
+        if let Err(err) = io::stdin().read_line(&mut line) {
+            eprintln!("ERROR: failed reading stdin: {err}");
+            return ExitCode::from(1);
+        }
+        if line.trim_end_matches(['\r', '\n']) != expected_stdin {
+            eprintln!("ERROR: unexpected stdin input: {line:?}");
+            return ExitCode::from(1);
+        }
     }
 
     if let Some(wait_path) = settings

@@ -7,5 +7,14 @@ readme = "README.md"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
+md-5 = "0.10"
+rookie-cookies = "0.6.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
+ureq = { version = "3.5", default-features = false, features = ["rustls", "gzip"] }
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3"

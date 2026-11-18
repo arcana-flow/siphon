@@ -1,0 +1,8 @@
+# Netscape HTTP Cookie File
+# Sanitized offline fixture for Siphon tests (no real credentials).
+
+.bilibili.com	TRUE	/	TRUE	4102444800	buvid3	SAN-BUVID3-0001
+#HttpOnly_.bilibili.com	TRUE	/	TRUE	4102444800	SESSDATA	sanitized-sessdata-token
+.bilibili.com	TRUE	/	TRUE	4102444800	bili_jct	sanitized-bili-jct
+.bilibili.com	TRUE	/	TRUE	1000000000	expired_cookie	must-not-be-sent
+.example.com	TRUE	/	TRUE	4102444800	foreign_cookie	must-not-leak-to-bilibili

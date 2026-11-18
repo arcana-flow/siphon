@@ -1,5 +1,7 @@
 //! Platform refresh integration contract and independent per-creator orchestration.
 
+use std::collections::HashSet;
+
 use crate::domain::{
     CookieSource, Creator, CreatorId, DiscoveredUpload, FollowedCreator, Platform, Timestamp,
 };
@@ -44,6 +46,22 @@ pub trait RefreshSource: Send + Sync {
         checkpoint: Timestamp,
         cookies: Option<&CookieSource>,
     ) -> Result<RefreshFeedResult, RefreshError>;
+
+    /// Fetches all pages for an active follow, distinguishing the initial `followed_at`
+    /// boundary (exclusive) from a subsequent `refresh_checkpoint` (inclusive replay).
+    ///
+    /// Returning `Err` leaves the creator's checkpoint unchanged in storage.
+    fn fetch_uploads_for_follow(
+        &self,
+        followed: &FollowedCreator,
+        cookies: Option<&CookieSource>,
+    ) -> Result<RefreshFeedResult, RefreshError> {
+        self.fetch_uploads_since(
+            &followed.creator,
+            followed.follow.refresh_checkpoint,
+            cookies,
+        )
+    }
 }
 
 /// Placeholder [`RefreshSource`] implementation used until the Bilibili backend is wired.
@@ -228,8 +246,16 @@ fn refresh_single_creator(
     target: &FollowedCreator,
     cookies: Option<&CookieSource>,
 ) -> Result<CommitRefreshOutcome, RefreshError> {
-    let feed =
-        source.fetch_uploads_since(&target.creator, target.follow.refresh_checkpoint, cookies)?;
+    let mut feed = source.fetch_uploads_for_follow(target, cookies)?;
+
+    // Never admit uploads at or before the initial follow boundary, and deduplicate
+    // repeated `(platform, platform_upload_id)` entries before handing off to storage.
+    let had_raw_uploads = !feed.uploads.is_empty();
+    let mut seen = HashSet::new();
+    feed.uploads.retain(|upload| {
+        upload.published_at > target.follow.followed_at
+            && seen.insert((upload.platform, upload.platform_upload_id.clone()))
+    });
 
     // Ensure a creator's refresh checkpoint never regresses even if an API feed is unordered.
     let max_discovered = feed
@@ -238,10 +264,13 @@ fn refresh_single_creator(
         .map(|upload| upload.published_at)
         .max()
         .unwrap_or(target.follow.refresh_checkpoint);
-    let new_checkpoint = feed
-        .new_checkpoint
-        .max(max_discovered)
-        .max(target.follow.refresh_checkpoint);
+    let new_checkpoint = if had_raw_uploads && feed.uploads.is_empty() {
+        target.follow.refresh_checkpoint
+    } else {
+        feed.new_checkpoint
+            .max(max_discovered)
+            .max(target.follow.refresh_checkpoint)
+    };
 
     let outcome = storage.commit_refresh(CommitRefreshRequest {
         creator_id: target.creator.id,

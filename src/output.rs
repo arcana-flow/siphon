@@ -228,7 +228,9 @@ impl JsonError {
         let details = match err {
             ValidationError::InvalidCreatorId { input }
             | ValidationError::InvalidUploadId { input }
-            | ValidationError::InvalidFollowId { input } => Some(serde_json::json!({
+            | ValidationError::InvalidFollowId { input }
+            | ValidationError::InvalidJobId { input }
+            | ValidationError::InvalidOwnershipToken { input } => Some(serde_json::json!({
                 "input": input,
             })),
             ValidationError::InvalidPresetName { input, reason } => Some(serde_json::json!({
@@ -244,11 +246,27 @@ impl JsonError {
             ValidationError::InvalidCookiePath { reason } => Some(serde_json::json!({
                 "reason": reason,
             })),
+            ValidationError::InvalidDisplayUrl { reason }
+            | ValidationError::InvalidProcessOwner { reason } => Some(serde_json::json!({
+                "reason": reason,
+            })),
             ValidationError::UnsupportedPlatform { platform } => Some(serde_json::json!({
                 "platform": platform,
             })),
             ValidationError::InvalidUploadStatus { status } => Some(serde_json::json!({
                 "status": status,
+            })),
+            ValidationError::InvalidJobKind { kind } => Some(serde_json::json!({
+                "kind": kind,
+            })),
+            ValidationError::InvalidJobState { state } => Some(serde_json::json!({
+                "state": state,
+            })),
+            ValidationError::InvalidDownloadStage { stage } => Some(serde_json::json!({
+                "stage": stage,
+            })),
+            ValidationError::InvalidExecutionMode { mode } => Some(serde_json::json!({
+                "mode": mode,
             })),
             ValidationError::EmptyDatabasePath => None,
         };
@@ -296,6 +314,20 @@ fn storage_error_details(err: &StorageError) -> Option<serde_json::Value> {
         | StorageError::PresetAlreadyExists { name }
         | StorageError::CannotModifyBuiltinPreset { name } => Some(serde_json::json!({
             "preset": name.as_str(),
+        })),
+        StorageError::JobNotFound { job_id } => Some(serde_json::json!({
+            "job_id": job_id.as_i64(),
+        })),
+        StorageError::OperationBusy { active } => Some(serde_json::json!({
+            "slot": active.slot.slot_key(),
+            "execution_mode": active.execution_mode.as_str(),
+            "job_id": active.job_id.map(|id| id.as_i64()),
+            "pid": active.owner.pid,
+            "acquired_at": active.acquired_at.format_utc_iso(),
+        })),
+        StorageError::StaleJobOwnership { job_id, slot } => Some(serde_json::json!({
+            "job_id": job_id.map(|id| id.as_i64()),
+            "slot": slot.map(|s| s.slot_key()),
         })),
         StorageError::NotImplemented
         | StorageError::CorruptedData(_)
@@ -2023,5 +2055,30 @@ mod tests {
             CommandResult::UploadsListed(vec![upload]).render_human(HumanRenderOptions::tty(false));
         assert!(uploads_tty.stdout.contains("ID  CREATOR  PUBLISHED"));
         assert!(!uploads_tty.stdout.contains('\t'));
+
+        // Job storage and validation errors map to stable snake_case codes with structured details.
+        let job_not_found = AppError::Storage(StorageError::JobNotFound {
+            job_id: crate::jobs::JobId::new(42).unwrap(),
+        });
+        let job_err_json = JsonError::from_app_error(&job_not_found, None);
+        assert_eq!(job_err_json.code, "job_not_found");
+        assert_eq!(job_err_json.details.unwrap()["job_id"], 42);
+
+        let busy = AppError::Storage(StorageError::OperationBusy {
+            active: Box::new(crate::jobs::ActiveOperation {
+                slot: crate::jobs::OperationSlot::Refresh,
+                execution_mode: crate::jobs::ExecutionMode::Background,
+                job_id: Some(crate::jobs::JobId::new(9).unwrap()),
+                owner_token: crate::jobs::OwnershipToken::new(3).unwrap(),
+                owner: crate::jobs::ProcessOwner::new(1234, None).unwrap(),
+                acquired_at: Timestamp::from_unix_seconds(1_700_000_000),
+            }),
+        });
+        let busy_json = JsonError::from_app_error(&busy, None);
+        assert_eq!(busy_json.code, "operation_busy");
+        let busy_details = busy_json.details.unwrap();
+        assert_eq!(busy_details["slot"], "refresh");
+        assert_eq!(busy_details["job_id"], 9);
+        assert_eq!(busy_details["pid"], 1234);
     }
 }

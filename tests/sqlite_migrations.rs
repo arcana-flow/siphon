@@ -95,6 +95,9 @@ fn fresh_database_creates_tables_indexes_pragmas_and_initial_defaults() {
         "download_preset_args",
         "download_presets",
         "follows",
+        "jobs",
+        "operation_reservations",
+        "ownership_sequence",
         "refresh_preferences",
         "schema_migrations",
         "uploads",
@@ -104,10 +107,15 @@ fn fresh_database_creates_tables_indexes_pragmas_and_initial_defaults() {
     .collect();
     assert_eq!(table_names(&conn), expected_tables);
 
-    let expected_indexes: BTreeSet<String> = ["idx_uploads_creator_id", "idx_uploads_status_id"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let expected_indexes: BTreeSet<String> = [
+        "idx_jobs_kind_id",
+        "idx_jobs_state_id",
+        "idx_uploads_creator_id",
+        "idx_uploads_status_id",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
     assert_eq!(index_names(&conn), expected_indexes);
 
     let journal_mode: String = conn
@@ -116,9 +124,11 @@ fn fresh_database_creates_tables_indexes_pragmas_and_initial_defaults() {
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 
     let applied = applied_migrations(&conn).unwrap();
-    assert_eq!(applied.len(), 1);
+    assert_eq!(applied.len(), 2);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
+    assert_eq!(applied[1].version, 2);
+    assert_eq!(applied[1].name, "add_jobs_and_operation_reservations");
 }
 
 #[test]
@@ -146,7 +156,7 @@ fn migrations_are_idempotent_across_reopens_and_from_connection() {
 
     let raw_conn = Connection::open(&db_path).unwrap();
     let initial_applied = applied_migrations(&raw_conn).unwrap();
-    assert_eq!(initial_applied.len(), 1);
+    assert_eq!(initial_applied.len(), 2);
     drop(raw_conn);
 
     let second = SqliteStorage::open(&db_path).unwrap();
@@ -440,5 +450,277 @@ fn concurrent_open_calls_on_new_database_succeed_cleanly() {
     }
 
     let conn = Connection::open(&db_path).unwrap();
-    assert_eq!(applied_migrations(&conn).unwrap().len(), 1);
+    assert_eq!(applied_migrations(&conn).unwrap().len(), 2);
+}
+
+#[test]
+fn migrates_from_released_v1_schema_preserving_all_existing_data() {
+    use siphon::domain::{CookieSource, DiscoveredUpload, PresetName};
+    use siphon::jobs::{JobState, JobStore, JobTarget, ProcessOwner, StartJobRequest};
+    use siphon::storage::CommitRefreshRequest;
+
+    let temp = TempDir::new("migrate-v1-to-v2");
+    let db_path = temp.path().join("released_v1.db");
+
+    // Seed an exact v1 released database populated with v1 domain records.
+    {
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_migrations(&mut conn, &MIGRATIONS[..1]).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 1);
+
+        conn.execute(
+            "INSERT INTO creators (platform, platform_creator_id, display_name)
+             VALUES ('bilibili', '1001', 'Creator V1')",
+            [],
+        )
+        .unwrap();
+        let creator_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO follows (creator_id, followed_at, refresh_checkpoint)
+             VALUES (?1, 1700000000, 1700000100)",
+            [creator_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO uploads (creator_id, platform, platform_upload_id, url, title, published_at, status)
+             VALUES (?1, 'bilibili', 'BV1v1', 'https://www.bilibili.com/video/BV1v1', 'V1 Upload', 1700000050, 'pending')",
+            [creator_id],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO download_presets (name) VALUES ('audio')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO download_preset_args (preset_name, position, arg) VALUES ('audio', 0, '-x')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE download_preferences SET default_preset_name = 'audio' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE refresh_preferences
+             SET cookie_source_kind = 'browser_profile', cookie_source_value = 'firefox'
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Reopen through SqliteStorage, which must migrate v1 -> v2 automatically.
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    assert_eq!(storage.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+
+    let followed = storage.list_followed_creators().unwrap();
+    assert_eq!(followed.len(), 1);
+    assert_eq!(followed[0].creator.display_name, "Creator V1");
+    assert_eq!(
+        followed[0].follow.refresh_checkpoint,
+        Timestamp::from_unix_seconds(1_700_000_100)
+    );
+
+    let pending = storage.list_pending_uploads().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].platform_upload_id, "BV1v1");
+
+    let default_preset = storage.get_default_preset().unwrap();
+    assert_eq!(default_preset.name, PresetName::new("audio").unwrap());
+    assert_eq!(default_preset.args, vec!["-x"]);
+    assert_eq!(
+        storage.get_default_refresh_cookies().unwrap(),
+        Some(CookieSource::BrowserProfile("firefox".to_owned()))
+    );
+
+    // Existing v1 operations still work post-migration.
+    let commit = storage
+        .commit_refresh(CommitRefreshRequest {
+            creator_id: followed[0].creator.id,
+            expected_follow_id: followed[0].follow.id,
+            expected_follow_time: followed[0].follow.followed_at,
+            expected_checkpoint: followed[0].follow.refresh_checkpoint,
+            new_checkpoint: Timestamp::from_unix_seconds(1_700_000_200),
+            discovered_uploads: vec![DiscoveredUpload {
+                platform: Platform::Bilibili,
+                platform_upload_id: "BV1v2".to_owned(),
+                url: "https://www.bilibili.com/video/BV1v2".to_owned(),
+                title: "V2 Upload".to_owned(),
+                published_at: Timestamp::from_unix_seconds(1_700_000_150),
+            }],
+        })
+        .unwrap();
+    assert_eq!(commit.new_uploads_inserted, 1);
+
+    // New v2 JobStore functionality works on the migrated database.
+    let started = storage
+        .start_background_job(StartJobRequest {
+            target: JobTarget::Refresh { creator_id: None },
+            owner: ProcessOwner::current_pid(),
+            started_at: Timestamp::from_unix_seconds(1_700_000_300),
+            initial_progress: None,
+        })
+        .unwrap();
+    assert_eq!(started.job.state, JobState::Running);
+    assert_eq!(storage.get_job(started.job.id).unwrap(), started.job);
+}
+
+#[test]
+fn v2_job_and_reservation_sql_constraints_are_enforced() {
+    let temp = TempDir::new("v2-constraints");
+    let db_path = temp.path().join("v2_constraints.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    drop(storage);
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+    // ownership_sequence singleton and positive token checks
+    assert!(
+        conn.execute(
+            "INSERT INTO ownership_sequence (id, next_token) VALUES (2, 1)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE ownership_sequence SET next_token = 0 WHERE id = 1",
+            []
+        )
+        .is_err()
+    );
+
+    // jobs target/state/owner CHECK constraints
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, state, started_at, updated_at, owner_token, owner_pid)
+             VALUES ('unknown', 'running', 1, 1, 1, 100)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, target_url, state, started_at, updated_at, owner_token, owner_pid)
+             VALUES ('refresh', 'https://example.com', 'running', 1, 1, 1, 100)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, state, started_at, updated_at, owner_token, owner_pid)
+             VALUES ('upload_download', 'running', 1, 1, 1, 100)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, state, started_at, updated_at, owner_token, owner_pid)
+             VALUES ('direct_download', 'running', 1, 1, 1, 100)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, state, started_at, updated_at, finished_at, owner_token, owner_pid)
+             VALUES ('refresh', 'running', 1, 1, 2, 1, 100)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, state, started_at, updated_at, finished_at, outcome_json, owner_token, owner_pid)
+             VALUES ('refresh', 'succeeded', 1, 1, NULL, '{}', 1, 100)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, state, started_at, updated_at, owner_token, owner_pid)
+             VALUES ('refresh', 'running', 1, 1, 1, 0)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO jobs (kind, state, started_at, updated_at, owner_token, owner_pid, owner_process_started_at)
+             VALUES ('refresh', 'running', 1, 1, 1, 100, '   ')",
+            [],
+        )
+        .is_err()
+    );
+
+    // Valid job insert + AUTOINCREMENT never reuses IDs after deletion
+    conn.execute(
+        "INSERT INTO jobs (kind, state, started_at, updated_at, owner_token, owner_pid)
+         VALUES ('refresh', 'running', 1, 1, 1, 100)",
+        [],
+    )
+    .unwrap();
+    let first_job_id = conn.last_insert_rowid();
+    assert_eq!(first_job_id, 1);
+
+    // operation_reservations constraints
+    assert!(
+        conn.execute(
+            "INSERT INTO operation_reservations
+             (slot_key, operation_kind, upload_id, execution_mode, job_id, owner_token, owner_pid, acquired_at)
+             VALUES ('refresh', 'refresh', NULL, 'foreground', ?1, 1, 100, 1)",
+            [first_job_id],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO operation_reservations
+             (slot_key, operation_kind, upload_id, execution_mode, job_id, owner_token, owner_pid, acquired_at)
+             VALUES ('refresh', 'refresh', NULL, 'background', NULL, 1, 100, 1)",
+            [],
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO operation_reservations
+             (slot_key, operation_kind, upload_id, execution_mode, job_id, owner_token, owner_pid, acquired_at)
+             VALUES ('wrong_key', 'upload_download', 7, 'foreground', NULL, 1, 100, 1)",
+            [],
+        )
+        .is_err()
+    );
+    conn.execute(
+        "INSERT INTO operation_reservations
+         (slot_key, operation_kind, upload_id, execution_mode, job_id, owner_token, owner_pid, acquired_at)
+         VALUES ('upload_download:7', 'upload_download', 7, 'background', ?1, 1, 100, 1)",
+        [first_job_id],
+    )
+    .unwrap();
+
+    // ON DELETE RESTRICT protects jobs referenced by operation_reservations
+    assert!(
+        conn.execute("DELETE FROM jobs WHERE id = ?1", [first_job_id])
+            .is_err()
+    );
+    conn.execute(
+        "DELETE FROM operation_reservations WHERE slot_key = 'upload_download:7'",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM jobs WHERE id = ?1", [first_job_id])
+        .unwrap();
+
+    conn.execute(
+        "INSERT INTO jobs (kind, state, started_at, updated_at, owner_token, owner_pid)
+         VALUES ('refresh', 'running', 2, 2, 2, 101)",
+        [],
+    )
+    .unwrap();
+    assert!(conn.last_insert_rowid() > first_job_id);
 }

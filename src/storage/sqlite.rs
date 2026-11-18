@@ -1,4 +1,6 @@
-//! SQLite implementation of Siphon's [`Storage`] contract.
+//! SQLite implementation of Siphon's [`Storage`] and [`JobStore`](crate::jobs::JobStore) contracts.
+
+mod jobs;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

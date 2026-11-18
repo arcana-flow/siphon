@@ -681,6 +681,22 @@ fn json_and_human_workflows_handle_all_commands_partial_refresh_and_download_str
         "media_to_stdout_not_allowed"
     );
 
+    // Explicit stdin config `--config-locations -` is rejected in JSON mode pre-spawn,
+    // while ordinary passthrough still forwards `--config-locations -`.
+    let refused_stdin_conf = runner.run_with_db(&[
+        "--json",
+        "download",
+        "https://www.bilibili.com/video/BV1stdinconf",
+        "--",
+        "--config-locations",
+        "-",
+    ]);
+    assert_eq!(refused_stdin_conf.status.code(), Some(1));
+    assert_eq!(
+        parse_single_json_stdout(&refused_stdin_conf)["error"]["code"],
+        "invalid_download_arguments"
+    );
+
     let refused_preset = runner.run_with_db(&[
         "--json",
         "download",
@@ -788,6 +804,24 @@ fn json_and_human_workflows_handle_all_commands_partial_refresh_and_download_str
         serde_json::from_str(String::from_utf8_lossy(&ordinary_j.stdout).trim()).unwrap();
     assert_eq!(ordinary_parsed["id"], "BV1plainjson");
     assert!(String::from_utf8_lossy(&ordinary_j.stderr).contains("Finished direct URL"));
+
+    // Ordinary passthrough preserves `--config-locations -`.
+    let ordinary_stdin_conf = runner.run_with_db(&[
+        "download",
+        "https://www.bilibili.com/video/BV1plainstdin",
+        "--no-preset",
+        "--",
+        "--config-locations",
+        "-",
+    ]);
+    assert!(ordinary_stdin_conf.status.success());
+    let last_logged = read_stub_log(&log_path).pop().unwrap();
+    assert!(
+        last_logged
+            .windows(2)
+            .any(|w| w == ["--config-locations", "-"]),
+        "expected --config-locations - forwarded in ordinary mode, got {last_logged:?}"
+    );
 
     // Creator remove + preset remove in JSON mode.
     let rm_preset = parse_single_json_stdout(&runner.run_with_db(&[

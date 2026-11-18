@@ -1365,9 +1365,11 @@ fn stream_and_capture_stderr<R: Read>(mut reader: R, forward_to_stderr: bool) ->
 ///   `--config-location` (and unambiguous `--config*` prefixes, bounded to depth 8 with canonical
 ///   cycle detection), `-P`/`--paths` home directory `yt-dlp.conf`, and standard `yt-dlp`
 ///   System/User/Home configuration locations.
-/// - Does not execute external `yt-dlp` plugins, read `--config-locations -` from stdin, expand
-///   dynamic shell/environment syntax, or resolve arbitrary `optparse` abbreviations beyond the
-///   recognized configuration and output options.
+/// - Rejects explicit stdin configuration (`--config-locations -`) in reserved-output mode because
+///   stdin options cannot be inspected statically before spawning `yt-dlp`.
+/// - Does not execute external `yt-dlp` plugins, expand dynamic shell/environment syntax, or
+///   resolve arbitrary `optparse` abbreviations beyond the recognized configuration and output
+///   options.
 pub fn ensure_no_media_to_stdout(
     request: &DownloadRequest,
     working_dir: &Path,
@@ -1425,15 +1427,15 @@ fn ensure_no_media_to_stdout_with_env(
                 }
             }
             for conf_path in active_defaults.into_iter().rev() {
-                load_config_file_recursive(&conf_path, working_dir, &mut visited, &mut state, 0);
+                load_config_file_recursive(&conf_path, working_dir, &mut visited, &mut state, 0)?;
             }
         }
         for explicit_conf in discovery.config_locations {
             if explicit_conf == Path::new("-") {
-                continue;
+                return Err(stdin_config_disallowed_error());
             }
             let resolved = resolve_config_location_path(&explicit_conf, working_dir);
-            load_config_file_recursive(&resolved, working_dir, &mut visited, &mut state, 0);
+            load_config_file_recursive(&resolved, working_dir, &mut visited, &mut state, 0)?;
         }
 
         state.scan_tokens(&request.preset_args, &preset_label, false);
@@ -1702,23 +1704,29 @@ fn resolve_config_location_path(raw: &Path, working_dir: &Path) -> PathBuf {
     resolved
 }
 
+fn stdin_config_disallowed_error() -> DownloadError {
+    DownloadError::InvalidArguments {
+        reason: "reading yt-dlp configuration from stdin ('--config-locations -') is not allowed in --json mode because output targets cannot be verified".to_owned(),
+    }
+}
+
 fn load_config_file_recursive(
     path: &Path,
     working_dir: &Path,
     visited: &mut BTreeSet<PathBuf>,
     state: &mut EffectiveOutputScan,
     depth: usize,
-) {
+) -> Result<(), DownloadError> {
     const MAX_CONFIG_DEPTH: usize = 8;
     if depth >= MAX_CONFIG_DEPTH || !path.is_file() {
-        return;
+        return Ok(());
     }
     let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(key) {
-        return;
+        return Ok(());
     }
     let Ok(contents) = fs::read_to_string(path) else {
-        return;
+        return Ok(());
     };
     let mut tokens = Vec::new();
     for line in contents.lines() {
@@ -1734,9 +1742,13 @@ fn load_config_file_recursive(
     state.scan_tokens(&tokens, &label, false);
     let newly_added: Vec<PathBuf> = state.config_locations[prev_len..].to_vec();
     for nested in newly_added {
+        if nested == Path::new("-") {
+            return Err(stdin_config_disallowed_error());
+        }
         let resolved = resolve_config_location_path(&nested, working_dir);
-        load_config_file_recursive(&resolved, working_dir, visited, state, depth + 1);
+        load_config_file_recursive(&resolved, working_dir, visited, state, depth + 1)?;
     }
+    Ok(())
 }
 
 fn tokenize_config_line(line: &str) -> Vec<String> {
@@ -3009,11 +3021,14 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let work_dir = temp.path().join("work");
         let home_dir = temp.path().join("home");
+        let appdata_dir = temp.path().join("appdata");
         fs::create_dir_all(&work_dir).unwrap();
         fs::create_dir_all(&home_dir).unwrap();
+        fs::create_dir_all(&appdata_dir).unwrap();
         let env_lookup = |key: &str| -> Option<OsString> {
             match key {
-                "HOME" => Some(home_dir.as_os_str().to_os_string()),
+                "HOME" | "USERPROFILE" => Some(home_dir.as_os_str().to_os_string()),
+                "APPDATA" => Some(appdata_dir.as_os_str().to_os_string()),
                 _ => None,
             }
         };
@@ -3127,8 +3142,29 @@ mod tests {
         );
         assert!(ensure_no_media_to_stdout_with_env(&cleared_conf, &work_dir, &env_lookup).is_ok());
 
+        // Explicit stdin config (`--config-locations -`) is rejected in reserved-output mode.
+        for stdin_flag in ["--config-locations", "--config-location", "--config"] {
+            let stdin_conf = direct_request(vec![], vec![stdin_flag, "-"]);
+            assert!(
+                matches!(
+                    ensure_no_media_to_stdout_with_env(&stdin_conf, &work_dir, &env_lookup),
+                    Err(DownloadError::InvalidArguments { .. })
+                ),
+                "expected stdin config rejection for {stdin_flag} -"
+            );
+        }
+        let stdin_cleared = direct_request(
+            vec![],
+            vec!["--config-locations", "-", "--no-config-locations"],
+        );
+        assert!(ensure_no_media_to_stdout_with_env(&stdin_cleared, &work_dir, &env_lookup).is_ok());
+
         // User config `-o -` is shadowed by Home (`-P home:...`) `yt-dlp.conf` overriding or ignoring it.
-        let user_conf_dir = home_dir.join(".config").join("yt-dlp");
+        let user_conf_dir = if cfg!(windows) {
+            appdata_dir.join("yt-dlp")
+        } else {
+            home_dir.join(".config").join("yt-dlp")
+        };
         fs::create_dir_all(&user_conf_dir).unwrap();
         fs::write(user_conf_dir.join("config"), "-o -\n").unwrap();
         let user_only = direct_request(vec![], vec![]);

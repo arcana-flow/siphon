@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 use crate::domain::{CreatorId, PresetName, UploadId, UploadStatus};
+use crate::jobs::{ActiveOperation, JobId, OperationSlot};
 
 /// Input and domain value validation failures.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -75,6 +76,62 @@ pub enum ValidationError {
         /// Raw status string.
         status: String,
     },
+
+    /// Job ID could not be parsed as a positive integer.
+    #[error("invalid job ID '{input}': expected a positive integer")]
+    InvalidJobId {
+        /// Raw user-provided value.
+        input: String,
+    },
+
+    /// Ownership token could not be parsed as a positive integer.
+    #[error("invalid ownership token '{input}': expected a positive integer")]
+    InvalidOwnershipToken {
+        /// Raw value.
+        input: String,
+    },
+
+    /// Unknown job kind identifier.
+    #[error("invalid job kind '{kind}'")]
+    InvalidJobKind {
+        /// Raw job kind string.
+        kind: String,
+    },
+
+    /// Unknown job state identifier.
+    #[error("invalid job state '{state}'")]
+    InvalidJobState {
+        /// Raw job state string.
+        state: String,
+    },
+
+    /// Unknown download stage identifier.
+    #[error("invalid download stage '{stage}'")]
+    InvalidDownloadStage {
+        /// Raw download stage string.
+        stage: String,
+    },
+
+    /// Unknown reservation execution mode identifier.
+    #[error("invalid execution mode '{mode}'")]
+    InvalidExecutionMode {
+        /// Raw execution mode string.
+        mode: String,
+    },
+
+    /// Display-safe job URL could not be parsed or redacted safely.
+    #[error("invalid job display URL: {reason}")]
+    InvalidDisplayUrl {
+        /// Explanation of why the URL was rejected.
+        reason: String,
+    },
+
+    /// Process owner metadata was invalid.
+    #[error("invalid process owner: {reason}")]
+    InvalidProcessOwner {
+        /// Explanation of the invalid owner metadata.
+        reason: String,
+    },
 }
 
 impl ValidationError {
@@ -92,6 +149,14 @@ impl ValidationError {
             Self::EmptyDatabasePath => "empty_database_path",
             Self::UnsupportedPlatform { .. } => "unsupported_platform",
             Self::InvalidUploadStatus { .. } => "invalid_upload_status",
+            Self::InvalidJobId { .. } => "invalid_job_id",
+            Self::InvalidOwnershipToken { .. } => "invalid_ownership_token",
+            Self::InvalidJobKind { .. } => "invalid_job_kind",
+            Self::InvalidJobState { .. } => "invalid_job_state",
+            Self::InvalidDownloadStage { .. } => "invalid_download_stage",
+            Self::InvalidExecutionMode { .. } => "invalid_execution_mode",
+            Self::InvalidDisplayUrl { .. } => "invalid_display_url",
+            Self::InvalidProcessOwner { .. } => "invalid_process_owner",
         }
     }
 }
@@ -172,6 +237,29 @@ pub enum StorageError {
         creator_id: CreatorId,
     },
 
+    /// Referenced background job does not exist in storage.
+    #[error("job {job_id} not found")]
+    JobNotFound {
+        /// Missing job ID.
+        job_id: JobId,
+    },
+
+    /// Requested exclusive operation conflicts with an active reservation or running job.
+    #[error("{active}")]
+    OperationBusy {
+        /// Snapshot of the active owner currently holding the requested slot.
+        active: Box<ActiveOperation>,
+    },
+
+    /// Job or reservation ownership is no longer active or was superseded by a newer owner.
+    #[error("{}", format_stale_job_ownership(*job_id, *slot))]
+    StaleJobOwnership {
+        /// Job ID whose ownership check failed, if applicable.
+        job_id: Option<JobId>,
+        /// Occupancy slot whose ownership check failed, if applicable.
+        slot: Option<OperationSlot>,
+    },
+
     /// Stored data violated expected schema invariants.
     #[error("corrupted storage state: {0}")]
     CorruptedData(String),
@@ -196,6 +284,9 @@ impl StorageError {
             Self::PresetAlreadyExists { .. } => "preset_already_exists",
             Self::CannotModifyBuiltinPreset { .. } => "cannot_modify_builtin_preset",
             Self::StaleRefreshCheckpoint { .. } => "stale_refresh_checkpoint",
+            Self::JobNotFound { .. } => "job_not_found",
+            Self::OperationBusy { .. } => "operation_busy",
+            Self::StaleJobOwnership { .. } => "stale_job_ownership",
             Self::CorruptedData(_) => "corrupted_storage_data",
             Self::Backend(_) => "storage_backend_error",
         }
@@ -416,4 +507,19 @@ fn format_partial_refresh(succeeded: usize, failures: &[CreatorRefreshFailure]) 
         .collect::<Vec<_>>()
         .join("; ");
     format!("refresh completed with {succeeded} succeeded and {failed} failed: {details}")
+}
+
+fn format_stale_job_ownership(job_id: Option<JobId>, slot: Option<OperationSlot>) -> String {
+    match (job_id, slot) {
+        (Some(job_id), Some(slot)) => {
+            format!("stale ownership for job {job_id} ({slot}): job is terminal or superseded")
+        }
+        (Some(job_id), None) => {
+            format!("stale ownership for job {job_id}: job is terminal or superseded")
+        }
+        (None, Some(slot)) => {
+            format!("stale ownership for {slot}: reservation was released or superseded")
+        }
+        (None, None) => "stale operation ownership".to_owned(),
+    }
 }

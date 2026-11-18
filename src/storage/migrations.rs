@@ -99,15 +99,81 @@ INSERT INTO refresh_preferences (id, cookie_source_kind, cookie_source_value)
 VALUES (1, NULL, NULL);
 "#;
 
+const MIGRATION_002_JOBS_AND_RESERVATIONS: &str = r#"
+CREATE TABLE ownership_sequence (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    next_token INTEGER NOT NULL CHECK (next_token >= 1)
+);
+
+INSERT INTO ownership_sequence (id, next_token)
+VALUES (1, 1);
+
+CREATE TABLE jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK (kind IN ('refresh', 'upload_download', 'direct_download')),
+    target_creator_id INTEGER NULL CHECK (target_creator_id IS NULL OR target_creator_id > 0),
+    target_upload_id INTEGER NULL CHECK (target_upload_id IS NULL OR target_upload_id > 0),
+    target_url TEXT NULL CHECK (target_url IS NULL OR length(trim(target_url)) > 0),
+    state TEXT NOT NULL CHECK (state IN ('running', 'succeeded', 'failed', 'interrupted')),
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER NULL,
+    progress_json TEXT NULL,
+    outcome_json TEXT NULL,
+    owner_token INTEGER NOT NULL CHECK (owner_token >= 1),
+    owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+    owner_process_started_at TEXT NULL CHECK (owner_process_started_at IS NULL OR length(trim(owner_process_started_at)) > 0),
+    CHECK (
+        (kind = 'refresh' AND target_upload_id IS NULL AND target_url IS NULL)
+        OR (kind = 'upload_download' AND target_creator_id IS NULL AND target_upload_id IS NOT NULL)
+        OR (kind = 'direct_download' AND target_creator_id IS NULL AND target_upload_id IS NULL AND target_url IS NOT NULL)
+    ),
+    CHECK (
+        (state = 'running' AND finished_at IS NULL AND outcome_json IS NULL)
+        OR (state IN ('succeeded', 'failed', 'interrupted') AND finished_at IS NOT NULL AND outcome_json IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_jobs_state_id ON jobs (state, id);
+CREATE INDEX idx_jobs_kind_id ON jobs (kind, id);
+
+CREATE TABLE operation_reservations (
+    slot_key TEXT PRIMARY KEY CHECK (length(slot_key) > 0),
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ('refresh', 'upload_download')),
+    upload_id INTEGER NULL CHECK (upload_id IS NULL OR upload_id > 0),
+    execution_mode TEXT NOT NULL CHECK (execution_mode IN ('foreground', 'background')),
+    job_id INTEGER NULL UNIQUE REFERENCES jobs(id) ON DELETE RESTRICT,
+    owner_token INTEGER NOT NULL CHECK (owner_token >= 1),
+    owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+    owner_process_started_at TEXT NULL CHECK (owner_process_started_at IS NULL OR length(trim(owner_process_started_at)) > 0),
+    acquired_at INTEGER NOT NULL,
+    CHECK (
+        (operation_kind = 'refresh' AND slot_key = 'refresh' AND upload_id IS NULL)
+        OR (operation_kind = 'upload_download' AND upload_id IS NOT NULL AND slot_key = ('upload_download:' || upload_id))
+    ),
+    CHECK (
+        (execution_mode = 'foreground' AND job_id IS NULL)
+        OR (execution_mode = 'background' AND job_id IS NOT NULL)
+    )
+);
+"#;
+
 /// Ordered list of built-in Siphon SQLite migrations.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_schema",
-    sql: MIGRATION_001_INITIAL_SCHEMA,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_schema",
+        sql: MIGRATION_001_INITIAL_SCHEMA,
+    },
+    Migration {
+        version: 2,
+        name: "add_jobs_and_operation_reservations",
+        sql: MIGRATION_002_JOBS_AND_RESERVATIONS,
+    },
+];
 
 /// Highest schema version supported by this build of Siphon.
-pub const LATEST_SCHEMA_VERSION: i64 = 1;
+pub const LATEST_SCHEMA_VERSION: i64 = 2;
 
 /// Applies all built-in Siphon migrations to `conn` if not already applied.
 pub fn apply(conn: &mut Connection) -> Result<(), StorageError> {
@@ -132,11 +198,11 @@ pub fn apply_migrations(
 fn apply_migrations_once(
     conn: &mut Connection,
     migrations: &[Migration],
-) -> Result<(), MigrationAttemptError> {
-    if schema_migrations_exists(conn).map_err(MigrationAttemptError::Sqlite)? {
-        let applied = read_applied_migrations(conn).map_err(MigrationAttemptError::Sqlite)?;
+) -> Result<(), AttemptError> {
+    if schema_migrations_exists(conn).map_err(AttemptError::Sqlite)? {
+        let applied = read_applied_migrations(conn).map_err(AttemptError::Sqlite)?;
         let pending_start =
-            validate_applied(&applied, migrations).map_err(MigrationAttemptError::Storage)?;
+            validate_applied(&applied, migrations).map_err(AttemptError::Storage)?;
         if pending_start == migrations.len() {
             return Ok(());
         }
@@ -144,7 +210,7 @@ fn apply_migrations_once(
 
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(MigrationAttemptError::Sqlite)?;
+        .map_err(AttemptError::Sqlite)?;
 
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -153,19 +219,18 @@ fn apply_migrations_once(
             applied_at INTEGER NOT NULL
         );",
     )
-    .map_err(MigrationAttemptError::Sqlite)?;
+    .map_err(AttemptError::Sqlite)?;
 
-    let applied = read_applied_migrations(&tx).map_err(MigrationAttemptError::Sqlite)?;
-    let pending_start =
-        validate_applied(&applied, migrations).map_err(MigrationAttemptError::Storage)?;
+    let applied = read_applied_migrations(&tx).map_err(AttemptError::Sqlite)?;
+    let pending_start = validate_applied(&applied, migrations).map_err(AttemptError::Storage)?;
 
     let applied_at = Timestamp::now().as_unix_seconds();
     for migration in &migrations[pending_start..] {
         tx.execute_batch(migration.sql).map_err(|err| {
             if is_sqlite_busy(&err) {
-                MigrationAttemptError::Sqlite(err)
+                AttemptError::Sqlite(err)
             } else {
-                MigrationAttemptError::Storage(StorageError::Backend(format!(
+                AttemptError::Storage(StorageError::Backend(format!(
                     "failed to apply migration v{} ('{}'): {err}",
                     migration.version, migration.name
                 )))
@@ -175,10 +240,10 @@ fn apply_migrations_once(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             params![migration.version, migration.name, applied_at],
         )
-        .map_err(MigrationAttemptError::Sqlite)?;
+        .map_err(AttemptError::Sqlite)?;
     }
 
-    tx.commit().map_err(MigrationAttemptError::Sqlite)
+    tx.commit().map_err(AttemptError::Sqlite)
 }
 
 /// Returns all migrations currently recorded in `schema_migrations`, ordered by version.
@@ -252,7 +317,7 @@ fn read_applied_migrations(conn: &Connection) -> Result<Vec<AppliedMigration>, r
     Ok(applied)
 }
 
-enum MigrationAttemptError {
+pub(crate) enum AttemptError {
     Sqlite(rusqlite::Error),
     Storage(StorageError),
 }
@@ -272,28 +337,26 @@ pub(crate) fn retry_sqlite_on_busy<T, F>(context: &str, mut op: F) -> Result<T, 
 where
     F: FnMut() -> Result<T, rusqlite::Error>,
 {
-    retry_storage_on_busy(context, || op().map_err(MigrationAttemptError::Sqlite))
+    retry_storage_on_busy(context, || op().map_err(AttemptError::Sqlite))
 }
 
-fn retry_storage_on_busy<T, F>(context: &str, mut op: F) -> Result<T, StorageError>
+pub(crate) fn retry_storage_on_busy<T, F>(context: &str, mut op: F) -> Result<T, StorageError>
 where
-    F: FnMut() -> Result<T, MigrationAttemptError>,
+    F: FnMut() -> Result<T, AttemptError>,
 {
     let deadline = Instant::now() + BUSY_RETRY_WINDOW;
     let mut backoff = Duration::from_millis(5);
     loop {
         match op() {
             Ok(value) => return Ok(value),
-            Err(MigrationAttemptError::Sqlite(err))
-                if is_sqlite_busy(&err) && Instant::now() < deadline =>
-            {
+            Err(AttemptError::Sqlite(err)) if is_sqlite_busy(&err) && Instant::now() < deadline => {
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_millis(50));
             }
-            Err(MigrationAttemptError::Sqlite(err)) => {
+            Err(AttemptError::Sqlite(err)) => {
                 return Err(StorageError::Backend(format!("{context}: {err}")));
             }
-            Err(MigrationAttemptError::Storage(err)) => return Err(err),
+            Err(AttemptError::Storage(err)) => return Err(err),
         }
     }
 }

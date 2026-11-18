@@ -6,12 +6,11 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::background::{ProcessTrackerConfig, spawn_tracked_command};
+use crate::background::{ProcessTrackerConfig, TrackedCommandSpec, spawn_tracked_command};
 use crate::domain::{CookieSource, PresetName, Upload, UploadId, UploadStatus};
 use crate::error::{AppError, DownloadError, StorageError};
 use crate::jobs::{DownloadProgress, DownloadStage};
@@ -612,36 +611,19 @@ impl Downloader for YtDlpDownloader {
         let _ = io::stderr().flush();
 
         // Pass each argument directly without invoking a shell.
-        let mut command = Command::new(&self.binary);
-        command.args(&argv);
-        if let Some(dir) = &self.working_dir {
-            command.current_dir(dir);
-        }
-        match options.stream_mode {
-            DownloadStreamMode::Passthrough => {
-                command.stdin(Stdio::inherit());
-                if request.target.is_pending_upload() {
-                    command.stdout(Stdio::piped());
-                } else {
-                    command.stdout(Stdio::inherit());
-                }
-            }
-            DownloadStreamMode::RedirectStdoutToStderr => {
-                command.stdin(Stdio::inherit());
-                command.stdout(Stdio::piped());
-            }
-            DownloadStreamMode::CaptureSilent => {
-                command.stdin(Stdio::null());
-                command.stdout(Stdio::piped());
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    command.creation_flags(CREATE_NO_WINDOW);
-                }
-            }
-        }
-        command.stderr(Stdio::piped());
+        let (inherit_stdin, pipe_stdout, create_no_window) = match options.stream_mode {
+            DownloadStreamMode::Passthrough => (true, request.target.is_pending_upload(), false),
+            DownloadStreamMode::RedirectStdoutToStderr => (true, true, false),
+            DownloadStreamMode::CaptureSilent => (false, true, true),
+        };
+        let spec = TrackedCommandSpec {
+            binary: self.binary.as_os_str(),
+            args: &argv,
+            working_dir: self.working_dir.as_deref(),
+            inherit_stdin,
+            pipe_stdout,
+            create_no_window,
+        };
 
         let stdout_target = match options.stream_mode {
             DownloadStreamMode::Passthrough => StdoutForwardTarget::Stdout,
@@ -650,20 +632,19 @@ impl Downloader for YtDlpDownloader {
         };
         let forward_stderr = !matches!(options.stream_mode, DownloadStreamMode::CaptureSilent);
 
-        let (mut child, child_guard) =
-            spawn_tracked_command(&mut command, tracking).map_err(|err| {
-                if is_binary_unavailable_error(&err) {
-                    DownloadError::DownloaderUnavailable {
-                        binary: self.binary.to_string_lossy().into_owned(),
-                        reason: err.to_string(),
-                    }
-                } else {
-                    DownloadError::Io(format!("failed to execute downloader process: {err}"))
+        let (mut child, child_guard) = spawn_tracked_command(&spec, tracking).map_err(|err| {
+            if is_binary_unavailable_error(&err) {
+                DownloadError::DownloaderUnavailable {
+                    binary: self.binary.to_string_lossy().into_owned(),
+                    reason: err.to_string(),
                 }
-            })?;
+            } else {
+                DownloadError::Io(format!("failed to execute downloader process: {err}"))
+            }
+        })?;
 
-        let child_stdout = child.stdout.take();
-        let child_stderr = child.stderr.take();
+        let child_stdout = child.take_stdout();
+        let child_stderr = child.take_stderr();
         let mut tracker = DownloadProgressTracker::new(DownloadStage::Resolving);
 
         let (status, stdout_attribution_paths, stdout_fallback_err, stderr_captured) =

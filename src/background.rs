@@ -6,7 +6,7 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,10 +38,10 @@ use crate::refresh::{
 };
 use crate::storage::{SqliteStorage, Storage};
 
-pub(crate) use process::spawn_tracked_command;
 pub use process::{
     ProcessLiveness, ProcessTrackerConfig, check_process_liveness, current_process_owner,
 };
+pub(crate) use process::{TrackedCommandSpec, spawn_tracked_command};
 
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(200);
@@ -460,33 +460,16 @@ fn spawn_and_await_worker(
         BackgroundError::Io(format!("failed to serialize worker launch payload: {err}"))
     })?;
 
-    let mut cmd = Command::new(&exe);
-    cmd.args(&runtime.worker_args);
-    cmd.current_dir(working_dir);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    process::configure_detached_worker_command(&mut cmd);
-
     let deadline = Instant::now() + runtime.ack_timeout;
 
-    let mut child = cmd
-        .spawn()
+    let worker = process::spawn_detached_worker_process(&exe, &runtime.worker_args, working_dir)
         .map_err(|err| BackgroundError::WorkerSpawnFailed {
             binary: exe.to_string_lossy().into_owned(),
             reason: err.to_string(),
         })?;
-
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        let _ = child.kill();
-        let _ = child.wait();
-        BackgroundError::Io("worker stdin pipe was unavailable".to_owned())
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        let _ = child.kill();
-        let _ = child.wait();
-        BackgroundError::Io("worker stdout pipe was unavailable".to_owned())
-    })?;
+    let mut child = worker.process;
+    let mut stdin = worker.stdin;
+    let stdout = worker.stdout;
 
     let (event_tx, event_rx) = mpsc::channel::<StartupPipeEvent>();
     let writer_tx = event_tx.clone();
@@ -512,7 +495,7 @@ fn spawn_and_await_worker(
                 // before draining the payload; wait for `AckRead` to surface that structured error.
                 if err.kind() != io::ErrorKind::BrokenPipe {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = child.wait_code();
                     return Err(BackgroundError::Io(format!(
                         "failed to deliver launch configuration to worker: {err}"
                     ))
@@ -522,7 +505,7 @@ fn spawn_and_await_worker(
             Ok(StartupPipeEvent::AckRead(res)) => break res,
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.wait_code();
                 return Err(BackgroundError::WorkerAckTimeout.into());
             }
         }
@@ -533,7 +516,7 @@ fn spawn_and_await_worker(
         Ok(Some(line)) => {
             let ack: WorkerAck = serde_json::from_str(line.trim()).map_err(|err| {
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.wait_code();
                 BackgroundError::WorkerStartupFailed {
                     reason: format!("invalid worker acknowledgment: {err}"),
                 }
@@ -547,17 +530,15 @@ fn spawn_and_await_worker(
                     Ok(parsed_id)
                 }
                 WorkerAck::Err { failure } => {
-                    let _ = child.wait();
+                    let _ = child.wait_code();
                     Err(failure.into_app_error())
                 }
             }
         }
         Ok(None) => {
-            let status_desc = match child.wait() {
-                Ok(status) => match status.code() {
-                    Some(code) => format!("exit code {code}"),
-                    None => "terminated by signal".to_owned(),
-                },
+            let status_desc = match child.wait_code() {
+                Ok(Some(code)) => format!("exit code {code}"),
+                Ok(None) => "terminated by signal".to_owned(),
                 Err(err) => format!("wait error: {err}"),
             };
             Err(BackgroundError::WorkerStartupFailed {
@@ -567,7 +548,7 @@ fn spawn_and_await_worker(
         }
         Err(err) => {
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.wait_code();
             Err(BackgroundError::Io(format!("failed reading worker acknowledgment: {err}")).into())
         }
     }
@@ -829,7 +810,7 @@ fn prepare_worker() -> Result<PreparedWorker, AppError> {
             reason: format!("invalid worker launch specification: {err}"),
         })?;
 
-    let db_path = spec.db_path.into_path_buf();
+    let requested_db_path = spec.db_path.into_path_buf();
     let working_dir = spec.working_dir.into_path_buf();
     let api_base = match spec.api_base {
         Some(base) => Some(base),
@@ -837,7 +818,11 @@ fn prepare_worker() -> Result<PreparedWorker, AppError> {
             .map_err(|reason| BackgroundError::WorkerStartupFailed { reason })?,
     };
 
-    let storage = SqliteStorage::open(&db_path)?;
+    let storage = SqliteStorage::open(&requested_db_path)?;
+    let db_path = storage
+        .database_path()
+        .map(Path::to_path_buf)
+        .unwrap_or(requested_db_path);
     let owner = current_process_owner();
 
     match spec.operation {
@@ -1146,7 +1131,6 @@ fn execute_download_worker(
         owner_token: lease.owner_token,
         owner: owner.clone(),
         execution_mode: ExecutionMode::Background,
-        isolate_process_group: false,
     };
 
     let download_res = downloader.download_with_tracking(

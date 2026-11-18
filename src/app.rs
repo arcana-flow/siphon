@@ -257,7 +257,6 @@ fn execute_download_command(
                 owner_token: guard.owner_token(),
                 owner: guard.owner().clone(),
                 execution_mode: ExecutionMode::Foreground,
-                isolate_process_group: true,
             };
             request.target = DownloadTarget::PendingUpload { upload: current };
             request.validate()?;

@@ -31,6 +31,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct SqliteStorage {
     conn: Mutex<Connection>,
+    db_path: Option<PathBuf>,
 }
 
 impl SqliteStorage {
@@ -44,7 +45,14 @@ impl SqliteStorage {
             ));
         }
 
-        if let Some(parent) = path.parent()
+        let absolute_path = std::path::absolute(path).map_err(|err| {
+            StorageError::Backend(format!(
+                "failed to resolve database path '{}': {err}",
+                path.display()
+            ))
+        })?;
+
+        if let Some(parent) = absolute_path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|err| {
@@ -55,16 +63,17 @@ impl SqliteStorage {
             })?;
         }
 
-        let mut conn = Connection::open(path).map_err(|err| {
+        let mut conn = Connection::open(&absolute_path).map_err(|err| {
             StorageError::Backend(format!(
                 "failed to open SQLite database '{}': {err}",
-                path.display()
+                absolute_path.display()
             ))
         })?;
         configure_connection(&conn, true)?;
         migrations::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: Some(absolute_path),
         })
     }
 
@@ -75,6 +84,7 @@ impl SqliteStorage {
         migrations::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: None,
         })
     }
 
@@ -84,6 +94,7 @@ impl SqliteStorage {
         migrations::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: None,
         })
     }
 
@@ -690,6 +701,14 @@ impl Storage for SqliteStorage {
         }
 
         tx.commit().map_err(map_sqlite_err)
+    }
+
+    fn job_store(&self) -> Option<&dyn crate::jobs::JobStore> {
+        Some(self)
+    }
+
+    fn database_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
     }
 }
 

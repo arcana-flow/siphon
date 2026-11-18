@@ -164,6 +164,17 @@ pub trait Storage: Send + Sync {
         &self,
         source: Option<&CookieSource>,
     ) -> Result<(), StorageError>;
+
+    /// Returns a [`JobStore`](crate::jobs::JobStore) interface when this backend supports
+    /// background job persistence and occupancy locks.
+    fn job_store(&self) -> Option<&dyn crate::jobs::JobStore> {
+        None
+    }
+
+    /// Returns the resolved file path of the backing database, if file-backed.
+    fn database_path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Placeholder [`Storage`] implementation used until the SQLite backend is wired.

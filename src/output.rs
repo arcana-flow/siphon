@@ -1,4 +1,15 @@
 //! Typed command outputs, JSON response envelopes, and TTY/plain human rendering.
+//!
+//! ## Extending for background jobs / new storage errors
+//!
+//! - New [`StorageError`] variants (for example, `JobNotFound`, `OperationBusy`, or
+//!   `StaleJobOwnership`) should add their stable snake_case code in
+//!   [`StorageError::error_code`] and any structured context in `storage_error_details`
+//!   inside this module.
+//! - New CLI commands (such as `job status` or `job list`) can add variants to
+//!   [`CommandResult`] or serialize any `Serialize` payload directly via [`JsonResponse::ok`],
+//!   and reuse [`crate::download::DownloadExecutionOptions::background_capture`] when running
+//!   `yt-dlp` from background workers.
 
 use std::env;
 use std::error::Error as _;

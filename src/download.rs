@@ -6,12 +6,14 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 
+use crate::background::{ProcessTrackerConfig, TrackedCommandSpec, spawn_tracked_command};
 use crate::domain::{CookieSource, PresetName, Upload, UploadId, UploadStatus};
 use crate::error::{AppError, DownloadError, StorageError};
+use crate::jobs::{DownloadProgress, DownloadStage};
 use crate::storage::Storage;
 
 /// Default executable name used to invoke `yt-dlp`.
@@ -311,6 +313,31 @@ pub trait Downloader: Send + Sync {
         }
         self.download(request)
     }
+
+    /// Executes the download with explicit [`DownloadExecutionOptions`] while emitting structured
+    /// [`DownloadProgress`] updates.
+    fn download_with_progress(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<DownloadOutcome, DownloadError> {
+        let _ = on_progress;
+        self.download_with_options(request, options)
+    }
+
+    /// Executes the download with optional OS child-process tracking for reservation/job
+    /// reconciliation when the parent Siphon process dies abruptly.
+    fn download_with_tracking(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+        tracking: Option<&ProcessTrackerConfig>,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<DownloadOutcome, DownloadError> {
+        let _ = tracking;
+        self.download_with_progress(request, options, on_progress)
+    }
 }
 
 /// Placeholder [`Downloader`] implementation used until the `yt-dlp` backend is wired.
@@ -472,12 +499,13 @@ impl YtDlpDownloader {
         &self,
         request: &DownloadRequest,
         manifest_path: Option<&Path>,
+        include_progress_template: bool,
     ) -> Result<Vec<OsString>, DownloadError> {
         request.validate()?;
         let cookie_args = self.prepare_cookie_args(request.cookies.as_ref())?;
 
         let mut argv = Vec::with_capacity(
-            request.preset_args.len() + request.extra_args.len() + cookie_args.len() + 10,
+            request.preset_args.len() + request.extra_args.len() + cookie_args.len() + 12,
         );
         if let Some(manifest) = manifest_path {
             let escaped_manifest = escape_yt_dlp_outtmpl_literal(manifest);
@@ -492,6 +520,10 @@ impl YtDlpDownloader {
                 "after_video:{\"kind\":\"subtitles\",\"id\":%(id)j,\"subtitles\":%(requested_subtitles.:.filepath)j}",
             ));
             argv.push(escaped_manifest);
+        }
+        if include_progress_template {
+            argv.push(OsString::from("--progress-template"));
+            argv.push(OsString::from(SIPHON_PROGRESS_TEMPLATE));
         }
 
         for arg in &request.preset_args {
@@ -511,6 +543,9 @@ impl YtDlpDownloader {
     }
 }
 
+const SIPHON_PROGRESS_PREFIX: &str = "__SIPHON_PROGRESS__:";
+const SIPHON_PROGRESS_TEMPLATE: &str = "download:__SIPHON_PROGRESS__:{\"status\":%(progress.status)j,\"downloaded_bytes\":%(progress.downloaded_bytes)j,\"total_bytes\":%(progress.total_bytes)j}";
+
 impl Downloader for YtDlpDownloader {
     fn download(&self, request: &DownloadRequest) -> Result<DownloadOutcome, DownloadError> {
         self.download_with_options(request, DownloadExecutionOptions::passthrough())
@@ -521,6 +556,25 @@ impl Downloader for YtDlpDownloader {
         request: &DownloadRequest,
         options: DownloadExecutionOptions,
     ) -> Result<DownloadOutcome, DownloadError> {
+        self.download_with_progress(request, options, &mut |_| {})
+    }
+
+    fn download_with_progress(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<DownloadOutcome, DownloadError> {
+        self.download_with_tracking(request, options, None, on_progress)
+    }
+
+    fn download_with_tracking(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+        tracking: Option<&ProcessTrackerConfig>,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<DownloadOutcome, DownloadError> {
         request.validate()?;
         let effective_working_dir = self.resolve_effective_working_dir()?;
         if options.refuse_media_to_stdout {
@@ -529,6 +583,9 @@ impl Downloader for YtDlpDownloader {
         let forwarded = request.forward_args();
         let mode = InvocationMode::from_args(&forwarded);
         let attach_manifest = !has_info_only_exit_flag(&forwarded);
+        let emit_progress = matches!(options.stream_mode, DownloadStreamMode::CaptureSilent);
+        let include_progress_template =
+            emit_progress && attach_manifest && !has_user_progress_override(&forwarded);
 
         let manifest_guard = if attach_manifest {
             Some(TempManifestFile::create()?)
@@ -536,37 +593,37 @@ impl Downloader for YtDlpDownloader {
             None
         };
 
-        let argv =
-            self.build_child_argv(request, manifest_guard.as_ref().map(TempManifestFile::path))?;
+        let argv = self.build_child_argv(
+            request,
+            manifest_guard.as_ref().map(TempManifestFile::path),
+            include_progress_template,
+        )?;
+
+        if emit_progress {
+            on_progress(DownloadProgress {
+                stage: DownloadStage::Resolving,
+                downloaded_bytes: None,
+                total_bytes: None,
+            });
+        }
 
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
 
         // Pass each argument directly without invoking a shell.
-        let mut command = Command::new(&self.binary);
-        command.args(&argv);
-        if let Some(dir) = &self.working_dir {
-            command.current_dir(dir);
-        }
-        match options.stream_mode {
-            DownloadStreamMode::Passthrough => {
-                command.stdin(Stdio::inherit());
-                if request.target.is_pending_upload() {
-                    command.stdout(Stdio::piped());
-                } else {
-                    command.stdout(Stdio::inherit());
-                }
-            }
-            DownloadStreamMode::RedirectStdoutToStderr => {
-                command.stdin(Stdio::inherit());
-                command.stdout(Stdio::piped());
-            }
-            DownloadStreamMode::CaptureSilent => {
-                command.stdin(Stdio::null());
-                command.stdout(Stdio::piped());
-            }
-        }
-        command.stderr(Stdio::piped());
+        let (inherit_stdin, pipe_stdout, create_no_window) = match options.stream_mode {
+            DownloadStreamMode::Passthrough => (true, request.target.is_pending_upload(), false),
+            DownloadStreamMode::RedirectStdoutToStderr => (true, true, false),
+            DownloadStreamMode::CaptureSilent => (false, true, true),
+        };
+        let spec = TrackedCommandSpec {
+            binary: self.binary.as_os_str(),
+            args: &argv,
+            working_dir: self.working_dir.as_deref(),
+            inherit_stdin,
+            pipe_stdout,
+            create_no_window,
+        };
 
         let stdout_target = match options.stream_mode {
             DownloadStreamMode::Passthrough => StdoutForwardTarget::Stdout,
@@ -575,7 +632,7 @@ impl Downloader for YtDlpDownloader {
         };
         let forward_stderr = !matches!(options.stream_mode, DownloadStreamMode::CaptureSilent);
 
-        let mut child = command.spawn().map_err(|err| {
+        let (mut child, child_guard) = spawn_tracked_command(&spec, tracking).map_err(|err| {
             if is_binary_unavailable_error(&err) {
                 DownloadError::DownloaderUnavailable {
                     binary: self.binary.to_string_lossy().into_owned(),
@@ -586,17 +643,38 @@ impl Downloader for YtDlpDownloader {
             }
         })?;
 
-        let child_stdout = child.stdout.take();
-        let child_stderr = child.stderr.take();
+        let child_stdout = child.take_stdout();
+        let child_stderr = child.take_stderr();
+        let mut tracker = DownloadProgressTracker::new(DownloadStage::Resolving);
 
         let (status, stdout_attribution_paths, stdout_fallback_err, stderr_captured) =
             thread::scope(|scope| {
+                let (line_tx, line_rx) = if emit_progress {
+                    let (tx, rx) = mpsc::channel::<String>();
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
+
+                let stdout_tx = line_tx.clone();
                 let stdout_handle = child_stdout.map(|reader| {
-                    scope.spawn(move || stream_stdout_with_attribution(reader, stdout_target))
+                    scope.spawn(move || {
+                        stream_stdout_with_attribution(reader, stdout_target, stdout_tx)
+                    })
                 });
+                let stderr_tx = line_tx;
                 let stderr_handle = child_stderr.map(|reader| {
-                    scope.spawn(move || stream_and_capture_stderr(reader, forward_stderr))
+                    scope
+                        .spawn(move || stream_and_capture_stderr(reader, forward_stderr, stderr_tx))
                 });
+
+                if let Some(rx) = line_rx {
+                    while let Ok(line) = rx.recv() {
+                        if let Some(next) = tracker.observe_line(&line) {
+                            on_progress(next);
+                        }
+                    }
+                }
 
                 let status_res = child.wait();
                 let (attr_paths, last_stdout_err) = match stdout_handle {
@@ -609,6 +687,8 @@ impl Downloader for YtDlpDownloader {
                 };
                 (status_res, attr_paths, last_stdout_err, captured_stderr)
             });
+
+        drop(child_guard);
 
         let status = status.map_err(|err| {
             DownloadError::Io(format!("failed to wait for downloader process: {err}"))
@@ -623,6 +703,14 @@ impl Downloader for YtDlpDownloader {
             return Err(DownloadError::ProcessFailed {
                 exit_code: status.code(),
                 stderr: detail,
+            });
+        }
+
+        if emit_progress {
+            on_progress(DownloadProgress {
+                stage: DownloadStage::Verifying,
+                downloaded_bytes: tracker.current.downloaded_bytes,
+                total_bytes: tracker.current.total_bytes,
             });
         }
 
@@ -689,14 +777,11 @@ pub fn execute_download(
     )
 }
 
-/// Resolves preset/target inputs, executes the download with explicit stream options, and updates
-/// pending upload status.
-pub fn execute_download_with_options(
+/// Resolves preset and target inputs into a concrete [`DownloadRequest`] using current storage.
+pub fn resolve_download_request(
     storage: &dyn Storage,
-    downloader: &dyn Downloader,
     input: DownloadPlanInput,
-    options: DownloadExecutionOptions,
-) -> Result<DownloadExecutionReport, AppError> {
+) -> Result<DownloadRequest, AppError> {
     let target = match input.target {
         DownloadTargetInput::Url(url) => DownloadTarget::DirectUrl { url },
         DownloadTargetInput::Upload(upload_id) => {
@@ -724,15 +809,49 @@ pub fn execute_download_with_options(
         }
     };
 
-    let request = DownloadRequest {
+    Ok(DownloadRequest {
         target,
         preset_name,
         preset_args,
         extra_args: input.extra_args,
         cookies: input.cookies,
-    };
+    })
+}
 
-    let outcome = downloader.download_with_options(&request, options)?;
+/// Resolves preset/target inputs, executes the download with explicit stream options, and updates
+/// pending upload status.
+pub fn execute_download_with_options(
+    storage: &dyn Storage,
+    downloader: &dyn Downloader,
+    input: DownloadPlanInput,
+    options: DownloadExecutionOptions,
+) -> Result<DownloadExecutionReport, AppError> {
+    let request = resolve_download_request(storage, input)?;
+    execute_resolved_download_with_options(storage, downloader, request, options)
+}
+
+/// Executes an already-resolved [`DownloadRequest`] with explicit stream options and updates
+/// pending upload status when artifacts are confirmed.
+pub fn execute_resolved_download_with_options(
+    storage: &dyn Storage,
+    downloader: &dyn Downloader,
+    request: DownloadRequest,
+    options: DownloadExecutionOptions,
+) -> Result<DownloadExecutionReport, AppError> {
+    execute_resolved_download_with_tracking(storage, downloader, request, options, None)
+}
+
+/// Executes an already-resolved [`DownloadRequest`] with explicit stream options and optional
+/// child-process tracking for reservation reconciliation, updating pending upload status when
+/// artifacts are confirmed.
+pub fn execute_resolved_download_with_tracking(
+    storage: &dyn Storage,
+    downloader: &dyn Downloader,
+    request: DownloadRequest,
+    options: DownloadExecutionOptions,
+    tracking: Option<&ProcessTrackerConfig>,
+) -> Result<DownloadExecutionReport, AppError> {
+    let outcome = downloader.download_with_tracking(&request, options, tracking, &mut |_| {})?;
     let marked_downloaded = match &request.target {
         DownloadTarget::PendingUpload { upload } if outcome.should_mark_downloaded() => {
             storage.mark_upload_downloaded(upload.id)?;
@@ -1240,6 +1359,50 @@ fn has_info_only_exit_flag(args: &[String]) -> bool {
     false
 }
 
+fn has_user_progress_override(args: &[String]) -> bool {
+    let mut expect_values = 0usize;
+    for arg in args {
+        if expect_values > 0 {
+            expect_values -= 1;
+            continue;
+        }
+        if arg == "--" {
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            continue;
+        }
+        if let Some(rest) = arg.strip_prefix("--") {
+            let (raw_name, inline) = match rest.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (rest, false),
+            };
+            if matches!(raw_name, "quiet" | "no-progress" | "progress-template") {
+                return true;
+            }
+            if !inline {
+                expect_values = known_arity_for_passthrough_scan(raw_name);
+            }
+            continue;
+        }
+
+        let shorts = &arg[1..];
+        for (idx, ch) in shorts.char_indices() {
+            if ch == 'q' {
+                return true;
+            }
+            if allowed_short_option_arity(ch) == Some(1) || ch == 'a' {
+                let has_inline = idx + ch.len_utf8() < shorts.len();
+                if !has_inline {
+                    expect_values = 1;
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdoutForwardTarget {
     Stdout,
@@ -1250,6 +1413,7 @@ enum StdoutForwardTarget {
 fn stream_stdout_with_attribution<R: Read>(
     mut reader: R,
     forward_target: StdoutForwardTarget,
+    line_tx: Option<mpsc::Sender<String>>,
 ) -> (Vec<PathBuf>, String) {
     const MAX_ATTR_PATHS: usize = 1024;
     const MAX_LINE_BYTES: usize = 8192;
@@ -1285,6 +1449,7 @@ fn stream_stdout_with_attribution<R: Read>(
                             &mut paths,
                             &mut last_non_empty,
                             MAX_ATTR_PATHS,
+                            line_tx.as_ref(),
                         );
                     } else if pending_line.len() < MAX_LINE_BYTES {
                         pending_line.push(byte);
@@ -1300,6 +1465,7 @@ fn stream_stdout_with_attribution<R: Read>(
             &mut paths,
             &mut last_non_empty,
             MAX_ATTR_PATHS,
+            line_tx.as_ref(),
         );
     }
     (paths, last_non_empty)
@@ -1310,6 +1476,7 @@ fn process_streamed_stdout_line(
     paths: &mut Vec<PathBuf>,
     last_non_empty: &mut String,
     max_attr_paths: usize,
+    line_tx: Option<&mpsc::Sender<String>>,
 ) {
     if pending_line.is_empty() {
         return;
@@ -1318,6 +1485,9 @@ fn process_streamed_stdout_line(
     let trimmed = text.trim();
     if !trimmed.is_empty() {
         *last_non_empty = trimmed.to_owned();
+        if let Some(tx) = line_tx {
+            let _ = tx.send(trimmed.to_owned());
+        }
         if paths.len() < max_attr_paths
             && let Some(path) = parse_stdout_artifact_line(trimmed)
         {
@@ -1327,9 +1497,15 @@ fn process_streamed_stdout_line(
     pending_line.clear();
 }
 
-fn stream_and_capture_stderr<R: Read>(mut reader: R, forward_to_stderr: bool) -> String {
+fn stream_and_capture_stderr<R: Read>(
+    mut reader: R,
+    forward_to_stderr: bool,
+    line_tx: Option<mpsc::Sender<String>>,
+) -> String {
     const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+    const MAX_LINE_BYTES: usize = 8192;
     let mut captured = Vec::new();
+    let mut pending_line = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         match reader.read(&mut buf) {
@@ -1345,11 +1521,228 @@ fn stream_and_capture_stderr<R: Read>(mut reader: R, forward_to_stderr: bool) ->
                     let remaining = MAX_CAPTURE_BYTES - captured.len();
                     captured.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 }
+                if let Some(tx) = line_tx.as_ref() {
+                    for &byte in chunk {
+                        if byte == b'\n' || byte == b'\r' {
+                            if !pending_line.is_empty() {
+                                let line = String::from_utf8_lossy(&pending_line).trim().to_owned();
+                                if !line.is_empty() {
+                                    let _ = tx.send(line);
+                                }
+                                pending_line.clear();
+                            }
+                        } else if pending_line.len() < MAX_LINE_BYTES {
+                            pending_line.push(byte);
+                        }
+                    }
+                }
             }
             Err(_) => break,
         }
     }
+    if let Some(tx) = line_tx.as_ref()
+        && !pending_line.is_empty()
+    {
+        let line = String::from_utf8_lossy(&pending_line).trim().to_owned();
+        if !line.is_empty() {
+            let _ = tx.send(line);
+        }
+    }
     String::from_utf8_lossy(&captured).into_owned()
+}
+
+struct DownloadProgressTracker {
+    current: DownloadProgress,
+}
+
+impl DownloadProgressTracker {
+    fn new(initial_stage: DownloadStage) -> Self {
+        Self {
+            current: DownloadProgress {
+                stage: initial_stage,
+                downloaded_bytes: None,
+                total_bytes: None,
+            },
+        }
+    }
+
+    fn observe_line(&mut self, raw_line: &str) -> Option<DownloadProgress> {
+        let next = parse_download_progress_line(raw_line, &self.current)?;
+        if next == self.current {
+            return None;
+        }
+        self.current = next.clone();
+        Some(next)
+    }
+}
+
+fn parse_download_progress_line(
+    raw_line: &str,
+    current: &DownloadProgress,
+) -> Option<DownloadProgress> {
+    let line = raw_line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    if let Some(payload) = line.strip_prefix(SIPHON_PROGRESS_PREFIX) {
+        let val: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+        let obj = val.as_object()?;
+        let downloaded_bytes = obj
+            .get("downloaded_bytes")
+            .and_then(serde_json::Value::as_u64);
+        let total_bytes = obj
+            .get("total_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&bytes| bytes > 0);
+        return Some(DownloadProgress {
+            stage: DownloadStage::Downloading,
+            downloaded_bytes,
+            total_bytes,
+        });
+    }
+
+    if is_post_processing_line(line) {
+        return Some(DownloadProgress {
+            stage: DownloadStage::PostProcessing,
+            downloaded_bytes: current.downloaded_bytes,
+            total_bytes: current.total_bytes,
+        });
+    }
+
+    if let Some(rest) = line.strip_prefix("[download]") {
+        let trimmed = rest.trim();
+        if let Some((downloaded_bytes, total_bytes)) = parse_standard_download_progress(trimmed) {
+            return Some(DownloadProgress {
+                stage: DownloadStage::Downloading,
+                downloaded_bytes,
+                total_bytes,
+            });
+        }
+        if trimmed.starts_with("Destination:")
+            || trimmed.starts_with("Downloading ")
+            || trimmed.ends_with(" has already been downloaded")
+        {
+            return Some(DownloadProgress {
+                stage: DownloadStage::Downloading,
+                downloaded_bytes: current.downloaded_bytes,
+                total_bytes: current.total_bytes,
+            });
+        }
+        return None;
+    }
+
+    if current.stage == DownloadStage::Preparing
+        && (line.starts_with("[info] ")
+            || line.starts_with("[BiliBili] ")
+            || line.starts_with("[bilibili] ")
+            || line.starts_with("[youtube] ")
+            || line.starts_with("[generic] "))
+    {
+        return Some(DownloadProgress {
+            stage: DownloadStage::Resolving,
+            downloaded_bytes: None,
+            total_bytes: None,
+        });
+    }
+
+    None
+}
+
+fn is_post_processing_line(line: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "[Merger]",
+        "[ExtractAudio]",
+        "[VideoRemuxer]",
+        "[VideoConvertor]",
+        "[EmbedSubtitle]",
+        "[EmbedThumbnail]",
+        "[MoveFiles]",
+        "[Metadata]",
+        "[SplitChapters]",
+        "[ModifyChapters]",
+        "[SponsorBlock]",
+        "[Fixup",
+    ];
+    PREFIXES.iter().any(|prefix| line.starts_with(prefix))
+}
+
+fn parse_standard_download_progress(body: &str) -> Option<(Option<u64>, Option<u64>)> {
+    if let Some((pct_part, after_pct)) = body.split_once('%') {
+        let pct: f64 = pct_part.trim().parse().ok()?;
+        if !(0.0..=100.0).contains(&pct) {
+            return None;
+        }
+        let after_of = after_pct.trim().strip_prefix("of")?.trim();
+        if after_of.starts_with('~')
+            || after_of.starts_with("Unknown")
+            || after_of.starts_with("N/A")
+        {
+            return Some((None, None));
+        }
+        let size_token = after_of.split_whitespace().next()?;
+        let total = parse_byte_size(size_token)?;
+        let downloaded = if pct >= 100.0 {
+            total
+        } else {
+            ((pct / 100.0) * (total as f64))
+                .round()
+                .clamp(0.0, total as f64) as u64
+        };
+        return Some((Some(downloaded), Some(total)));
+    }
+
+    // Format without percentage: e.g. `512B / 1024B` or `5.00MiB at 2.00MiB/s`
+    if let Some((left, right)) = body.split_once('/') {
+        let dl = parse_byte_size(left.split_whitespace().next()?)?;
+        let right_trim = right.trim();
+        let total = if right_trim.starts_with('~') || right_trim.starts_with("Unknown") {
+            None
+        } else {
+            right_trim
+                .split_whitespace()
+                .next()
+                .and_then(parse_byte_size)
+        };
+        return Some((Some(dl), total));
+    }
+
+    if let Some((left, _)) = body.split_once(" at ") {
+        let dl = parse_byte_size(left.trim())?;
+        return Some((Some(dl), None));
+    }
+
+    None
+}
+
+fn parse_byte_size(token: &str) -> Option<u64> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() || trimmed.starts_with('~') {
+        return None;
+    }
+    let suffixes: &[(&str, f64)] = &[
+        ("TiB", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("GiB", 1024.0 * 1024.0 * 1024.0),
+        ("MiB", 1024.0 * 1024.0),
+        ("KiB", 1024.0),
+        ("TB", 1000.0 * 1000.0 * 1000.0 * 1000.0),
+        ("GB", 1000.0 * 1000.0 * 1000.0),
+        ("MB", 1000.0 * 1000.0),
+        ("KB", 1000.0),
+        ("kB", 1000.0),
+        ("bytes", 1.0),
+        ("B", 1.0),
+    ];
+    for &(suffix, mult) in suffixes {
+        if let Some(num_str) = trimmed.strip_suffix(suffix) {
+            let value: f64 = num_str.trim().parse().ok()?;
+            if !value.is_finite() || value < 0.0 {
+                return None;
+            }
+            return Some((value * mult).round() as u64);
+        }
+    }
+    None
 }
 
 /// Rejects invocations whose effective `yt-dlp` output templates would stream media to stdout
@@ -1706,7 +2099,7 @@ fn resolve_config_location_path(raw: &Path, working_dir: &Path) -> PathBuf {
 
 fn stdin_config_disallowed_error() -> DownloadError {
     DownloadError::InvalidArguments {
-        reason: "reading yt-dlp configuration from stdin ('--config-locations -') is not allowed in --json mode because output targets cannot be verified".to_owned(),
+        reason: "reading yt-dlp configuration from stdin ('--config-locations -') is not allowed when --json or --background is enabled because output targets cannot be verified".to_owned(),
     }
 }
 
@@ -3179,5 +3572,51 @@ mod tests {
         assert!(
             ensure_no_media_to_stdout_with_env(&home_ignores_user, &work_dir, &env_lookup).is_ok()
         );
+    }
+
+    #[test]
+    fn parses_download_stages_and_reliable_transfer_totals() {
+        let mut tracker = DownloadProgressTracker::new(DownloadStage::Resolving);
+
+        // Structured --progress-template with exact bytes.
+        let p1 = tracker
+            .observe_line(
+                r#"__SIPHON_PROGRESS__:{"status":"downloading","downloaded_bytes":512,"total_bytes":1024}"#,
+            )
+            .unwrap();
+        assert_eq!(p1.stage, DownloadStage::Downloading);
+        assert_eq!(p1.downloaded_bytes, Some(512));
+        assert_eq!(p1.total_bytes, Some(1024));
+
+        // Structured --progress-template where total_bytes is null (only estimate/unknown).
+        let p2 = tracker
+            .observe_line(
+                r#"__SIPHON_PROGRESS__:{"status":"downloading","downloaded_bytes":768,"total_bytes":null}"#,
+            )
+            .unwrap();
+        assert_eq!(p2.stage, DownloadStage::Downloading);
+        assert_eq!(p2.downloaded_bytes, Some(768));
+        assert_eq!(p2.total_bytes, None);
+
+        // Standard yt-dlp text progress with exact size vs approximate `~` size.
+        let p3 = tracker
+            .observe_line("[download]  50.0% of 1000B at 500B/s ETA 00:01")
+            .unwrap();
+        assert_eq!(p3.stage, DownloadStage::Downloading);
+        assert_eq!(p3.downloaded_bytes, Some(500));
+        assert_eq!(p3.total_bytes, Some(1000));
+
+        let p4 = tracker
+            .observe_line("[download]  75.0% of ~ 10.00MiB at 1.00MiB/s ETA 00:02")
+            .unwrap();
+        assert_eq!(p4.stage, DownloadStage::Downloading);
+        assert_eq!(p4.downloaded_bytes, None);
+        assert_eq!(p4.total_bytes, None);
+
+        // Post-processing marker transitions stage.
+        let p5 = tracker
+            .observe_line("[Merger] Merging formats into \"video.mp4\"")
+            .unwrap();
+        assert_eq!(p5.stage, DownloadStage::PostProcessing);
     }
 }

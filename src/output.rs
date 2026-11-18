@@ -24,7 +24,10 @@ use crate::domain::{
     UploadStatus,
 };
 use crate::download::{DownloadExecutionReport, DownloadTarget};
-use crate::error::{AppError, DownloadError, RefreshError, StorageError, ValidationError};
+use crate::error::{
+    AppError, BackgroundError, DownloadError, RefreshError, StorageError, ValidationError,
+};
+use crate::jobs::{CreatorJobOutcome, JobOutcome, JobProgress, JobRecord, JobState, JobTarget};
 use crate::refresh::{CreatorRefreshOutcome, RefreshSummary};
 
 const ANSI_RESET: &str = "\x1b[0m";
@@ -187,6 +190,7 @@ impl JsonError {
             AppError::Storage(storage) => storage_error_details(storage),
             AppError::Refresh(refresh) => refresh_error_details(refresh),
             AppError::Download(download) => download_error_details(download),
+            AppError::Background(background) => background_error_details(background),
             AppError::RefreshPartialFailure {
                 succeeded,
                 failures,
@@ -386,6 +390,21 @@ fn download_error_details(err: &DownloadError) -> Option<serde_json::Value> {
     }
 }
 
+fn background_error_details(err: &BackgroundError) -> Option<serde_json::Value> {
+    match err {
+        BackgroundError::WorkerSpawnFailed { binary, reason } => Some(serde_json::json!({
+            "binary": binary,
+            "reason": reason,
+        })),
+        BackgroundError::WorkerStartupFailed { reason } => Some(serde_json::json!({
+            "reason": reason,
+        })),
+        BackgroundError::UnsupportedStorage
+        | BackgroundError::WorkerAckTimeout
+        | BackgroundError::Io(_) => None,
+    }
+}
+
 /// Typed outcome of any Siphon CLI command prior to rendering as JSON or human text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandResult {
@@ -411,6 +430,10 @@ pub enum CommandResult {
     PresetRemoved(crate::storage::RemovePresetOutcome),
     /// Result of `siphon preset set-default <NAME>`.
     PresetDefaultSet(DownloadPreset),
+    /// Result of `siphon download --background` or `siphon refresh --background`.
+    JobStarted(JobRecord),
+    /// Result of `siphon job status <ID>`.
+    JobStatus(JobRecord),
 }
 
 impl CommandResult {
@@ -453,6 +476,9 @@ impl CommandResult {
             Self::PresetDefaultSet(preset) => serde_json::to_value(PresetMutationData {
                 preset: PresetDto::from_domain(preset),
             }),
+            Self::JobStarted(job) | Self::JobStatus(job) => {
+                serde_json::to_value(JobRecordDto::from_domain(job))
+            }
         }
     }
 
@@ -518,6 +544,16 @@ impl CommandResult {
             )),
             Self::PresetDefaultSet(preset) => CommandOutput::from_stdout(render_preset_default(
                 preset,
+                options.stdout_tty,
+                options.stdout_color,
+            )),
+            Self::JobStarted(job) => CommandOutput::from_stdout(render_job_started(
+                job,
+                options.stdout_tty,
+                options.stdout_color,
+            )),
+            Self::JobStatus(job) => CommandOutput::from_stdout(render_job_status(
+                job,
                 options.stdout_tty,
                 options.stdout_color,
             )),
@@ -1141,6 +1177,204 @@ struct PresetRemovedData {
     reset_default_to_builtin: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum JobTargetDto {
+    Refresh { creator_id: Option<i64> },
+    UploadDownload { upload_id: i64, url: Option<String> },
+    DirectDownload { url: String },
+}
+
+impl JobTargetDto {
+    fn from_domain(target: &JobTarget) -> Self {
+        match target {
+            JobTarget::Refresh { creator_id } => Self::Refresh {
+                creator_id: creator_id.map(|id| id.as_i64()),
+            },
+            JobTarget::UploadDownload { upload_id, url } => Self::UploadDownload {
+                upload_id: upload_id.as_i64(),
+                url: url.as_ref().map(|u| u.as_str().to_owned()),
+            },
+            JobTarget::DirectDownload { url } => Self::DirectDownload {
+                url: url.as_str().to_owned(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum JobProgressDto {
+    Refresh {
+        total_creators: Option<u64>,
+        processed_creators: u64,
+        succeeded_creators: u64,
+        failed_creators: u64,
+        current_creator_id: Option<i64>,
+        current_creator_name: Option<String>,
+    },
+    Download {
+        stage: &'static str,
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    },
+}
+
+impl JobProgressDto {
+    fn from_domain(progress: &JobProgress) -> Self {
+        match progress {
+            JobProgress::Refresh(refresh) => Self::Refresh {
+                total_creators: refresh.total_creators,
+                processed_creators: refresh.processed_creators,
+                succeeded_creators: refresh.succeeded_creators,
+                failed_creators: refresh.failed_creators,
+                current_creator_id: refresh.current_creator_id.map(|id| id.as_i64()),
+                current_creator_name: refresh.current_creator_name.clone(),
+            },
+            JobProgress::Download(download) => Self::Download {
+                stage: download.stage.as_str(),
+                downloaded_bytes: download.downloaded_bytes,
+                total_bytes: download.total_bytes,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum JobCreatorOutcomeDto {
+    Succeeded {
+        creator_id: i64,
+        display_name: String,
+        new_uploads_inserted: u64,
+        existing_uploads_seen: u64,
+        previous_checkpoint: String,
+        new_checkpoint: String,
+    },
+    Failed {
+        creator_id: i64,
+        display_name: String,
+        error: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum JobOutcomeDto {
+    Refresh {
+        succeeded: usize,
+        failed: usize,
+        total: usize,
+        creator_outcomes: Vec<JobCreatorOutcomeDto>,
+        error: Option<String>,
+    },
+    Download {
+        confirmed_artifacts: Vec<String>,
+        marked_downloaded: bool,
+        error: Option<String>,
+    },
+    Interrupted {
+        reason: String,
+    },
+}
+
+impl JobOutcomeDto {
+    fn from_domain(outcome: &JobOutcome) -> Self {
+        match outcome {
+            JobOutcome::Refresh(refresh) => {
+                let mut succeeded = 0usize;
+                let mut failed = 0usize;
+                let creator_outcomes = refresh
+                    .creator_outcomes
+                    .iter()
+                    .map(|item| match item {
+                        CreatorJobOutcome::Succeeded {
+                            creator_id,
+                            display_name,
+                            new_uploads_inserted,
+                            existing_uploads_seen,
+                            previous_checkpoint,
+                            new_checkpoint,
+                        } => {
+                            succeeded += 1;
+                            JobCreatorOutcomeDto::Succeeded {
+                                creator_id: creator_id.as_i64(),
+                                display_name: display_name.clone(),
+                                new_uploads_inserted: *new_uploads_inserted,
+                                existing_uploads_seen: *existing_uploads_seen,
+                                previous_checkpoint: previous_checkpoint.format_utc_iso(),
+                                new_checkpoint: new_checkpoint.format_utc_iso(),
+                            }
+                        }
+                        CreatorJobOutcome::Failed {
+                            creator_id,
+                            display_name,
+                            error,
+                        } => {
+                            failed += 1;
+                            JobCreatorOutcomeDto::Failed {
+                                creator_id: creator_id.as_i64(),
+                                display_name: display_name.clone(),
+                                error: error.clone(),
+                            }
+                        }
+                    })
+                    .collect();
+                Self::Refresh {
+                    succeeded,
+                    failed,
+                    total: succeeded + failed,
+                    creator_outcomes,
+                    error: refresh.error.clone(),
+                }
+            }
+            JobOutcome::Download(download) => Self::Download {
+                confirmed_artifacts: download
+                    .confirmed_artifacts
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                marked_downloaded: download.marked_downloaded,
+                error: download.error.clone(),
+            },
+            JobOutcome::Interrupted(interrupted) => Self::Interrupted {
+                reason: interrupted.reason.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct JobRecordDto {
+    id: i64,
+    kind: &'static str,
+    target: JobTargetDto,
+    state: &'static str,
+    pid: u32,
+    started_at: String,
+    updated_at: String,
+    finished_at: Option<String>,
+    progress: Option<JobProgressDto>,
+    outcome: Option<JobOutcomeDto>,
+}
+
+impl JobRecordDto {
+    fn from_domain(job: &JobRecord) -> Self {
+        Self {
+            id: job.id.as_i64(),
+            kind: job.target.kind().as_str(),
+            target: JobTargetDto::from_domain(&job.target),
+            state: job.state.as_str(),
+            pid: job.owner.pid,
+            started_at: job.started_at.format_utc_iso(),
+            updated_at: job.updated_at.format_utc_iso(),
+            finished_at: job.finished_at.map(Timestamp::format_utc_iso),
+            progress: job.progress.as_ref().map(JobProgressDto::from_domain),
+            outcome: job.outcome.as_ref().map(JobOutcomeDto::from_domain),
+        }
+    }
+}
+
 fn render_creator_added(followed: &FollowedCreator, is_tty: bool, color: bool) -> String {
     if !is_tty {
         return format!(
@@ -1591,6 +1825,213 @@ fn render_preset_default(preset: &DownloadPreset, is_tty: bool, color: bool) -> 
         "{badge} preset set to '{}'\n",
         style_bold(preset.name.as_str(), color)
     )
+}
+
+fn describe_job_target(target: &JobTarget) -> String {
+    match target {
+        JobTarget::Refresh { creator_id: None } => "all followed creators".to_owned(),
+        JobTarget::Refresh {
+            creator_id: Some(id),
+        } => format!("creator {id}"),
+        JobTarget::UploadDownload { upload_id, url } => match url {
+            Some(display_url) => format!("upload {upload_id} ({display_url})"),
+            None => format!("upload {upload_id}"),
+        },
+        JobTarget::DirectDownload { url } => url.as_str().to_owned(),
+    }
+}
+
+fn render_job_started(job: &JobRecord, is_tty: bool, color: bool) -> String {
+    let target_desc = describe_job_target(&job.target);
+    let kind = job.target.kind();
+    if !is_tty {
+        return format!("Started background {kind} job {} ({target_desc})\n", job.id);
+    }
+    let badge = style_badge("Started", ANSI_GREEN, color);
+    format!(
+        "{badge} background {kind} job {} ({target_desc})\n",
+        style_bold(&job.id.to_string(), color)
+    )
+}
+
+fn format_job_progress_line(progress: &JobProgress) -> String {
+    match progress {
+        JobProgress::Refresh(refresh) => {
+            let total_str = refresh
+                .total_creators
+                .map_or_else(|| "?".to_owned(), |n| n.to_string());
+            let mut summary = format!(
+                "{}/{} creators processed ({} succeeded, {} failed)",
+                refresh.processed_creators,
+                total_str,
+                refresh.succeeded_creators,
+                refresh.failed_creators
+            );
+            if let Some(cid) = refresh.current_creator_id {
+                match &refresh.current_creator_name {
+                    Some(name) => {
+                        let _ = write!(summary, "; current: creator {cid} ({name})");
+                    }
+                    None => {
+                        let _ = write!(summary, "; current: creator {cid}");
+                    }
+                }
+            }
+            summary
+        }
+        JobProgress::Download(download) => {
+            let mut summary = format!("stage={}", download.stage);
+            match (download.downloaded_bytes, download.total_bytes) {
+                (Some(dl), Some(total)) => {
+                    let _ = write!(summary, ", downloaded={dl} B, total={total} B");
+                }
+                (Some(dl), None) => {
+                    let _ = write!(summary, ", downloaded={dl} B, total=unknown");
+                }
+                (None, Some(total)) => {
+                    let _ = write!(summary, ", total={total} B");
+                }
+                (None, None) => {}
+            }
+            summary
+        }
+    }
+}
+
+fn render_job_status(job: &JobRecord, is_tty: bool, color: bool) -> String {
+    let mut out = String::new();
+    let kind = job.target.kind();
+    let target_desc = describe_job_target(&job.target);
+
+    if is_tty {
+        let (state_label, state_color) = match job.state {
+            JobState::Running => ("RUNNING", ANSI_CYAN),
+            JobState::Succeeded => ("SUCCEEDED", ANSI_GREEN),
+            JobState::Failed => ("FAILED", ANSI_RED),
+            JobState::Interrupted => ("INTERRUPTED", ANSI_YELLOW),
+        };
+        let badge = style_badge(state_label, state_color, color);
+        let _ = writeln!(
+            out,
+            "{} {badge}",
+            style_bold(&format!("Job {}", job.id), color)
+        );
+    } else {
+        let _ = writeln!(out, "Job {}", job.id);
+    }
+
+    let _ = writeln!(out, "kind: {kind}");
+    let _ = writeln!(out, "target: {target_desc}");
+    let _ = writeln!(out, "state: {}", job.state);
+    let _ = writeln!(out, "pid: {}", job.owner.pid);
+    if is_tty {
+        let _ = writeln!(
+            out,
+            "started_at: {}",
+            style_dim(&job.started_at.format_utc_iso(), color)
+        );
+        let _ = writeln!(
+            out,
+            "updated_at: {}",
+            style_dim(&job.updated_at.format_utc_iso(), color)
+        );
+        if let Some(finished_at) = job.finished_at {
+            let _ = writeln!(
+                out,
+                "finished_at: {}",
+                style_dim(&finished_at.format_utc_iso(), color)
+            );
+        }
+    } else {
+        let _ = writeln!(out, "started_at: {}", job.started_at.format_utc_iso());
+        let _ = writeln!(out, "updated_at: {}", job.updated_at.format_utc_iso());
+        if let Some(finished_at) = job.finished_at {
+            let _ = writeln!(out, "finished_at: {}", finished_at.format_utc_iso());
+        }
+    }
+
+    if let Some(progress) = &job.progress {
+        let _ = writeln!(out, "progress: {}", format_job_progress_line(progress));
+    }
+
+    if let Some(outcome) = &job.outcome {
+        match outcome {
+            JobOutcome::Refresh(refresh) => {
+                let succeeded = refresh
+                    .creator_outcomes
+                    .iter()
+                    .filter(|item| matches!(item, CreatorJobOutcome::Succeeded { .. }))
+                    .count();
+                let failed = refresh.creator_outcomes.len() - succeeded;
+                let _ = write!(
+                    out,
+                    "outcome: {succeeded} succeeded, {failed} failed ({} total)",
+                    refresh.creator_outcomes.len()
+                );
+                if let Some(err) = &refresh.error {
+                    let _ = write!(out, "; error: {err}");
+                }
+                out.push('\n');
+                for item in &refresh.creator_outcomes {
+                    match item {
+                        CreatorJobOutcome::Succeeded {
+                            creator_id,
+                            display_name,
+                            new_uploads_inserted,
+                            existing_uploads_seen,
+                            previous_checkpoint,
+                            new_checkpoint,
+                        } => {
+                            let badge = if is_tty {
+                                format!("{} ", style_badge("OK  ", ANSI_GREEN, color))
+                            } else {
+                                String::new()
+                            };
+                            let _ = writeln!(
+                                out,
+                                "  {badge}creator {creator_id} ({display_name}): {new_uploads_inserted} new, {existing_uploads_seen} known, checkpoint {previous_checkpoint} -> {new_checkpoint}"
+                            );
+                        }
+                        CreatorJobOutcome::Failed {
+                            creator_id,
+                            display_name,
+                            error,
+                        } => {
+                            let badge = if is_tty {
+                                format!("{} ", style_badge("FAIL", ANSI_RED, color))
+                            } else {
+                                String::new()
+                            };
+                            let _ = writeln!(
+                                out,
+                                "  {badge}creator {creator_id} ({display_name}): failed: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+            JobOutcome::Download(download) => {
+                if let Some(err) = &download.error {
+                    let _ = writeln!(out, "outcome: failed: {err}");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "outcome: succeeded ({} artifact(s), marked_downloaded={})",
+                        download.confirmed_artifacts.len(),
+                        download.marked_downloaded
+                    );
+                }
+                for artifact in &download.confirmed_artifacts {
+                    let _ = writeln!(out, "  artifact: {}", artifact.display());
+                }
+            }
+            JobOutcome::Interrupted(interrupted) => {
+                let _ = writeln!(out, "outcome: interrupted ({})", interrupted.reason);
+            }
+        }
+    }
+
+    out
 }
 
 fn render_aligned_table<const N: usize, F>(
@@ -2080,5 +2521,202 @@ mod tests {
         assert_eq!(busy_details["slot"], "refresh");
         assert_eq!(busy_details["job_id"], 9);
         assert_eq!(busy_details["pid"], 1234);
+
+        let spawn_err = AppError::Background(BackgroundError::WorkerSpawnFailed {
+            binary: "/bin/missing".to_owned(),
+            reason: "not found".to_owned(),
+        });
+        let spawn_json = JsonError::from_app_error(&spawn_err, None);
+        assert_eq!(spawn_json.code, "background_worker_spawn_failed");
+        assert_eq!(spawn_json.details.unwrap()["binary"], "/bin/missing");
+
+        let help = HelpData::from_clap_command(&["siphon".to_owned()], &Cli::command());
+        assert!(help.subcommands.iter().any(|s| s.name == "job"));
+        assert!(!help.subcommands.iter().any(|s| s.name == "__worker"));
+    }
+
+    #[test]
+    fn job_started_and_job_status_render_json_and_human_outputs() {
+        use crate::jobs::{
+            DisplayUrl, DownloadJobOutcome, DownloadProgress, DownloadStage, InterruptedJobOutcome,
+            JobId, OwnershipToken, ProcessOwner, RefreshJobOutcome,
+        };
+
+        let t0 = Timestamp::from_unix_seconds(1_760_000_000);
+        let t1 = Timestamp::from_unix_seconds(1_760_000_015);
+        let cid1 = CreatorId::new(1).unwrap();
+        let cid2 = CreatorId::new(2).unwrap();
+
+        let running_dl = JobRecord {
+            id: JobId::new(7).unwrap(),
+            target: JobTarget::DirectDownload {
+                url: DisplayUrl::sanitize("https://u:p@example.com/watch?token=abc#frag").unwrap(),
+            },
+            state: JobState::Running,
+            started_at: t0,
+            updated_at: t1,
+            finished_at: None,
+            progress: Some(JobProgress::Download(DownloadProgress {
+                stage: DownloadStage::Downloading,
+                downloaded_bytes: Some(512),
+                total_bytes: None,
+            })),
+            outcome: None,
+            owner_token: OwnershipToken::new(3).unwrap(),
+            owner: ProcessOwner::new(4321, Some("marker-1".to_owned())).unwrap(),
+        };
+
+        let started_json: serde_json::Value = serde_json::from_str(
+            &CommandResult::JobStarted(running_dl.clone())
+                .to_json_line()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(started_json["ok"], true);
+        assert_eq!(started_json["data"]["id"], 7);
+        assert_eq!(started_json["data"]["state"], "running");
+        assert_eq!(
+            started_json["data"]["target"]["url"],
+            "https://example.com/watch"
+        );
+        assert_eq!(started_json["data"]["progress"]["stage"], "downloading");
+        assert_eq!(started_json["data"]["progress"]["downloaded_bytes"], 512);
+        assert!(started_json["data"]["progress"]["total_bytes"].is_null());
+
+        let started_human =
+            CommandResult::JobStarted(running_dl.clone()).render_human(HumanRenderOptions::plain());
+        assert!(
+            started_human
+                .stdout
+                .contains("Started background direct_download job 7")
+        );
+        assert!(started_human.stdout.contains("https://example.com/watch"));
+
+        let status_running_human =
+            CommandResult::JobStatus(running_dl).render_human(HumanRenderOptions::plain());
+        assert!(status_running_human.stdout.contains("Job 7"));
+        assert!(status_running_human.stdout.contains("state: running"));
+        assert!(
+            status_running_human
+                .stdout
+                .contains("downloaded=512 B, total=unknown")
+        );
+
+        let mixed_refresh = JobRecord {
+            id: JobId::new(8).unwrap(),
+            target: JobTarget::Refresh { creator_id: None },
+            state: JobState::Failed,
+            started_at: t0,
+            updated_at: t1,
+            finished_at: Some(t1),
+            progress: Some(JobProgress::Refresh(crate::jobs::RefreshProgress {
+                total_creators: Some(2),
+                processed_creators: 2,
+                succeeded_creators: 1,
+                failed_creators: 1,
+                current_creator_id: None,
+                current_creator_name: None,
+            })),
+            outcome: Some(JobOutcome::Refresh(RefreshJobOutcome {
+                creator_outcomes: vec![
+                    CreatorJobOutcome::Succeeded {
+                        creator_id: cid1,
+                        display_name: "Alice".to_owned(),
+                        new_uploads_inserted: 2,
+                        existing_uploads_seen: 1,
+                        previous_checkpoint: t0,
+                        new_checkpoint: t1,
+                    },
+                    CreatorJobOutcome::Failed {
+                        creator_id: cid2,
+                        display_name: "Bob".to_owned(),
+                        error: "network timeout".to_owned(),
+                    },
+                ],
+                error: Some("1 of 2 creator(s) failed".to_owned()),
+            })),
+            owner_token: OwnershipToken::new(4).unwrap(),
+            owner: ProcessOwner::new(4322, None).unwrap(),
+        };
+
+        let refresh_json: serde_json::Value = serde_json::from_str(
+            &CommandResult::JobStatus(mixed_refresh.clone())
+                .to_json_line()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refresh_json["ok"], true);
+        assert_eq!(refresh_json["data"]["state"], "failed");
+        assert_eq!(refresh_json["data"]["outcome"]["kind"], "refresh");
+        assert_eq!(refresh_json["data"]["outcome"]["succeeded"], 1);
+        assert_eq!(refresh_json["data"]["outcome"]["failed"], 1);
+        assert_eq!(
+            refresh_json["data"]["outcome"]["creator_outcomes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let refresh_tty =
+            CommandResult::JobStatus(mixed_refresh).render_human(HumanRenderOptions::tty(true));
+        assert!(refresh_tty.stdout.contains("FAILED"));
+        assert!(refresh_tty.stdout.contains("Alice"));
+        assert!(refresh_tty.stdout.contains("Bob"));
+        assert!(refresh_tty.stdout.contains("network timeout"));
+
+        let interrupted_job = JobRecord {
+            id: JobId::new(9).unwrap(),
+            target: JobTarget::UploadDownload {
+                upload_id: UploadId::new(5).unwrap(),
+                url: Some(DisplayUrl::sanitize("https://example.com/video/BV5").unwrap()),
+            },
+            state: JobState::Interrupted,
+            started_at: t0,
+            updated_at: t1,
+            finished_at: Some(t1),
+            progress: None,
+            outcome: Some(JobOutcome::Interrupted(InterruptedJobOutcome {
+                reason: "process 999 is no longer running".to_owned(),
+            })),
+            owner_token: OwnershipToken::new(5).unwrap(),
+            owner: ProcessOwner::new(999, None).unwrap(),
+        };
+        let interrupted_human = CommandResult::JobStatus(interrupted_job.clone())
+            .render_human(HumanRenderOptions::plain());
+        assert!(interrupted_human.stdout.contains("state: interrupted"));
+        assert!(
+            interrupted_human
+                .stdout
+                .contains("process 999 is no longer running")
+        );
+
+        let failed_dl = JobRecord {
+            id: JobId::new(10).unwrap(),
+            target: JobTarget::UploadDownload {
+                upload_id: UploadId::new(6).unwrap(),
+                url: None,
+            },
+            state: JobState::Succeeded,
+            started_at: t0,
+            updated_at: t1,
+            finished_at: Some(t1),
+            progress: Some(JobProgress::Download(DownloadProgress {
+                stage: DownloadStage::Verifying,
+                downloaded_bytes: Some(1024),
+                total_bytes: Some(1024),
+            })),
+            outcome: Some(JobOutcome::Download(DownloadJobOutcome {
+                confirmed_artifacts: vec![std::path::PathBuf::from("video.mp4")],
+                marked_downloaded: true,
+                error: None,
+            })),
+            owner_token: OwnershipToken::new(6).unwrap(),
+            owner: ProcessOwner::new(1000, None).unwrap(),
+        };
+        let dl_human =
+            CommandResult::JobStatus(failed_dl).render_human(HumanRenderOptions::plain());
+        assert!(dl_human.stdout.contains("downloaded=1024 B, total=1024 B"));
+        assert!(dl_human.stdout.contains("artifact: video.mp4"));
     }
 }

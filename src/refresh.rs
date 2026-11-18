@@ -178,6 +178,40 @@ pub fn follow_creator(
     Ok(followed)
 }
 
+/// Live lifecycle event emitted while refreshing followed creators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshExecutionEvent<'a> {
+    /// Starting fetch and commit for the creator at `index` (0-based out of `total`).
+    StartingCreator {
+        /// Zero-based index of the creator being started.
+        index: usize,
+        /// Total number of creators in this refresh run.
+        total: usize,
+        /// Followed creator being refreshed.
+        creator: &'a FollowedCreator,
+    },
+    /// Completed fetch and commit (succeeded or failed) for the creator at `index`.
+    FinishedCreator {
+        /// Zero-based index of the creator that finished.
+        index: usize,
+        /// Total number of creators in this refresh run.
+        total: usize,
+        /// Per-creator outcome.
+        outcome: &'a CreatorRefreshOutcome,
+    },
+}
+
+/// Resolves the followed creator targets for `siphon refresh [CREATOR_ID]`.
+pub fn resolve_refresh_targets(
+    storage: &dyn Storage,
+    creator_id: Option<CreatorId>,
+) -> Result<Vec<FollowedCreator>, AppError> {
+    match creator_id {
+        Some(id) => Ok(vec![storage.get_followed_creator(id)?]),
+        None => Ok(storage.list_followed_creators()?),
+    }
+}
+
 /// Refreshes either a single followed creator or all followed creators independently.
 ///
 /// Each creator's fetch and transactional checkpoint commit runs independently so a failure on
@@ -188,24 +222,13 @@ pub fn refresh_creators(
     creator_id: Option<CreatorId>,
     cookie_policy: RefreshCookiePolicy,
 ) -> Result<RefreshSummary, AppError> {
-    let targets = match creator_id {
-        Some(id) => vec![storage.get_followed_creator(id)?],
-        None => storage.list_followed_creators()?,
-    };
+    let targets = resolve_refresh_targets(storage, creator_id)?;
 
     let (used_cookies, cleared_default_cookies, saved_default_cookies) =
         resolve_refresh_cookies(storage, cookie_policy)?;
 
-    let mut outcomes = Vec::with_capacity(targets.len());
-    for target in targets {
-        match refresh_single_creator(storage, source, &target, used_cookies.as_ref()) {
-            Ok(committed) => outcomes.push(CreatorRefreshOutcome::Succeeded(committed)),
-            Err(error) => outcomes.push(CreatorRefreshOutcome::Failed {
-                creator: target,
-                error,
-            }),
-        }
-    }
+    let outcomes =
+        refresh_targets_with_observer(storage, source, targets, used_cookies.as_ref(), &mut |_| {});
 
     Ok(RefreshSummary {
         outcomes,
@@ -213,6 +236,42 @@ pub fn refresh_creators(
         cleared_default_cookies,
         saved_default_cookies,
     })
+}
+
+/// Refreshes pre-resolved `targets` using `used_cookies`, emitting per-creator progress events.
+pub fn refresh_targets_with_observer<F>(
+    storage: &dyn Storage,
+    source: &dyn RefreshSource,
+    targets: Vec<FollowedCreator>,
+    used_cookies: Option<&CookieSource>,
+    on_event: &mut F,
+) -> Vec<CreatorRefreshOutcome>
+where
+    F: FnMut(RefreshExecutionEvent<'_>),
+{
+    let total = targets.len();
+    let mut outcomes = Vec::with_capacity(total);
+    for (index, target) in targets.into_iter().enumerate() {
+        on_event(RefreshExecutionEvent::StartingCreator {
+            index,
+            total,
+            creator: &target,
+        });
+        let outcome = match refresh_single_creator(storage, source, &target, used_cookies) {
+            Ok(committed) => CreatorRefreshOutcome::Succeeded(committed),
+            Err(error) => CreatorRefreshOutcome::Failed {
+                creator: target,
+                error,
+            },
+        };
+        on_event(RefreshExecutionEvent::FinishedCreator {
+            index,
+            total,
+            outcome: &outcome,
+        });
+        outcomes.push(outcome);
+    }
+    outcomes
 }
 
 fn resolve_refresh_cookies(

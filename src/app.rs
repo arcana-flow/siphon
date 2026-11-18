@@ -1,9 +1,17 @@
 //! Command dispatch wiring connecting the CLI to storage, refresh, and download services.
 
-use crate::cli::{Cli, Command, CreatorCommand, PresetCommand, UploadCommand};
-use crate::domain::Timestamp;
-use crate::download::{DownloadExecutionOptions, execute_download_with_options};
-use crate::error::{AppError, DownloadError};
+use crate::background::{
+    BackgroundRuntime, ProcessTrackerConfig, acquire_reservation_with_reconcile,
+    query_job_status_with_reconcile, submit_background_download, submit_background_refresh,
+};
+use crate::cli::{Cli, Command, CreatorCommand, JobCommand, PresetCommand, UploadCommand};
+use crate::domain::{Timestamp, UploadStatus};
+use crate::download::{
+    DownloadExecutionOptions, DownloadTarget, execute_resolved_download_with_tracking,
+    resolve_download_request,
+};
+use crate::error::{AppError, BackgroundError, DownloadError, StorageError};
+use crate::jobs::{ExecutionMode, OperationSlot};
 use crate::output::{CommandResult, HumanRenderOptions};
 use crate::refresh::{follow_creator, refresh_creators};
 use crate::storage::Storage;
@@ -85,18 +93,28 @@ pub fn execute_with_options(
     services: &AppServices<'_>,
     options: AppExecuteOptions,
 ) -> CommandExecution {
+    execute_with_runtime(cli, services, options, &BackgroundRuntime::default())
+}
+
+/// Dispatches a parsed [`Cli`] command with explicit [`AppExecuteOptions`] and [`BackgroundRuntime`].
+pub fn execute_with_runtime(
+    cli: Cli,
+    services: &AppServices<'_>,
+    options: AppExecuteOptions,
+    background: &BackgroundRuntime,
+) -> CommandExecution {
     match cli.command {
         Command::Creator(args) => match execute_creator(args.command, services) {
             Ok(res) => CommandExecution::ok(res),
             Err(err) => CommandExecution::err(err),
         },
-        Command::Refresh(args) => execute_refresh(args, services),
+        Command::Refresh(args) => execute_refresh(args, services, background),
         Command::Upload(args) => match execute_upload(args.command, services.storage) {
             Ok(res) => CommandExecution::ok(res),
             Err(err) => CommandExecution::err(err),
         },
         Command::Download(args) => {
-            match execute_download_command(args, services, options.download) {
+            match execute_download_command(args, services, options.download, background) {
                 Ok(res) => CommandExecution::ok(res),
                 Err(err) => CommandExecution::err(err),
             }
@@ -105,6 +123,17 @@ pub fn execute_with_options(
             Ok(res) => CommandExecution::ok(res),
             Err(err) => CommandExecution::err(err),
         },
+        Command::Job(args) => match execute_job(args.command, services.storage) {
+            Ok(res) => CommandExecution::ok(res),
+            Err(err) => CommandExecution::err(err),
+        },
+        Command::InternalWorker => CommandExecution::err(
+            BackgroundError::WorkerStartupFailed {
+                reason: "internal worker command cannot be dispatched through app::execute"
+                    .to_owned(),
+            }
+            .into(),
+        ),
     }
 }
 
@@ -133,11 +162,34 @@ fn execute_creator(
     }
 }
 
-fn execute_refresh(args: crate::cli::RefreshArgs, services: &AppServices<'_>) -> CommandExecution {
+fn execute_refresh(
+    args: crate::cli::RefreshArgs,
+    services: &AppServices<'_>,
+    background: &BackgroundRuntime,
+) -> CommandExecution {
+    if args.background {
+        return match submit_background_refresh(services.storage, args, background) {
+            Ok(job) => CommandExecution::ok(CommandResult::JobStarted(job)),
+            Err(err) => CommandExecution::err(err),
+        };
+    }
+
     let policy = match args.cookie_policy() {
         Ok(policy) => policy,
         Err(err) => return CommandExecution::err(err.into()),
     };
+    let _reservation_guard = match services.storage.job_store() {
+        Some(job_store) => match acquire_reservation_with_reconcile(
+            job_store,
+            services.storage.database_path(),
+            OperationSlot::Refresh,
+        ) {
+            Ok(guard) => Some(guard),
+            Err(err) => return CommandExecution::err(err),
+        },
+        None => None,
+    };
+
     let summary = match refresh_creators(
         services.storage,
         services.refresh_source,
@@ -173,20 +225,59 @@ fn execute_download_command(
     args: crate::cli::DownloadArgs,
     services: &AppServices<'_>,
     download_options: DownloadExecutionOptions,
+    background: &BackgroundRuntime,
 ) -> Result<CommandResult, AppError> {
+    if args.background {
+        let job = submit_background_download(services.storage, args, background)?;
+        return Ok(CommandResult::JobStarted(job));
+    }
+
     let plan = args.to_plan_input()?;
-    let report = execute_download_with_options(
+    let mut request = resolve_download_request(services.storage, plan)?;
+    request.validate()?;
+
+    let db_path = services.storage.database_path();
+    let (_reservation_guard, tracking) = match (&request.target, services.storage.job_store()) {
+        (DownloadTarget::PendingUpload { upload }, Some(job_store)) => {
+            let guard = acquire_reservation_with_reconcile(
+                job_store,
+                db_path,
+                OperationSlot::UploadDownload(upload.id),
+            )?;
+            let current = services.storage.get_upload(upload.id)?;
+            if current.status != UploadStatus::Pending {
+                return Err(StorageError::UploadNotPending {
+                    upload_id: upload.id,
+                    status: current.status,
+                }
+                .into());
+            }
+            let tracker = ProcessTrackerConfig {
+                db_path: db_path.map(std::path::Path::to_path_buf),
+                owner_token: guard.owner_token(),
+                owner: guard.owner().clone(),
+                execution_mode: ExecutionMode::Foreground,
+            };
+            request.target = DownloadTarget::PendingUpload { upload: current };
+            request.validate()?;
+            (Some(guard), Some(tracker))
+        }
+        _ => (None, None),
+    };
+
+    let report = execute_resolved_download_with_tracking(
         services.storage,
         services.downloader,
-        plan,
+        request,
         download_options,
+        tracking.as_ref(),
     )?;
     if !report.outcome.succeeded {
         let message = match &report.request.target {
-            crate::download::DownloadTarget::DirectUrl { url } => {
+            DownloadTarget::DirectUrl { url } => {
                 format!("downloader reported an unsuccessful outcome for {url}")
             }
-            crate::download::DownloadTarget::PendingUpload { upload } => {
+            DownloadTarget::PendingUpload { upload } => {
                 format!(
                     "downloader reported an unsuccessful outcome for upload {} ({}); status remains {}",
                     upload.id, upload.title, upload.status
@@ -200,6 +291,16 @@ fn execute_download_command(
     }
 
     Ok(CommandResult::Downloaded(report))
+}
+
+fn execute_job(command: JobCommand, storage: &dyn Storage) -> Result<CommandResult, AppError> {
+    match command {
+        JobCommand::Status { id } => {
+            let job_store = storage.job_store().ok_or(StorageError::NotImplemented)?;
+            let job = query_job_status_with_reconcile(job_store, storage.database_path(), id)?;
+            Ok(CommandResult::JobStatus(job))
+        }
+    }
 }
 
 fn execute_preset(

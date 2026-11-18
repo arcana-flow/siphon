@@ -398,7 +398,9 @@ pub enum DownloadError {
     },
 
     /// Effective downloader options would stream media to stdout while stdout is reserved.
-    #[error("streaming media to stdout ('{source_detail}') is not allowed when --json is enabled")]
+    #[error(
+        "streaming media to stdout ('{source_detail}') is not allowed when --json or --background is enabled"
+    )]
     MediaToStdoutDisallowed {
         /// Where the stdout output template originated (CLI, preset, or config).
         source_detail: String,
@@ -451,6 +453,52 @@ pub struct CreatorRefreshFailure {
     pub error: String,
 }
 
+/// Errors produced while launching, acknowledging, or querying detached background jobs.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BackgroundError {
+    /// Selected storage backend does not support detached background execution.
+    #[error("background jobs require a file-backed SQLite database")]
+    UnsupportedStorage,
+
+    /// Failed to spawn the detached background worker process.
+    #[error("failed to start background worker '{binary}': {reason}")]
+    WorkerSpawnFailed {
+        /// Worker executable path attempted.
+        binary: String,
+        /// Underlying OS error description.
+        reason: String,
+    },
+
+    /// Worker process exited or failed before acknowledging job ownership.
+    #[error("background worker failed to claim job ownership: {reason}")]
+    WorkerStartupFailed {
+        /// Diagnostic summary of the worker startup failure.
+        reason: String,
+    },
+
+    /// Worker process did not acknowledge ownership within the startup deadline.
+    #[error("timed out waiting for background worker to acknowledge job ownership")]
+    WorkerAckTimeout,
+
+    /// Unexpected I/O error preparing or communicating with the background worker.
+    #[error("background job I/O error: {0}")]
+    Io(String),
+}
+
+impl BackgroundError {
+    /// Returns the stable machine-readable error code for this background execution failure.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedStorage => "background_storage_unsupported",
+            Self::WorkerSpawnFailed { .. } => "background_worker_spawn_failed",
+            Self::WorkerStartupFailed { .. } => "background_worker_startup_failed",
+            Self::WorkerAckTimeout => "background_worker_ack_timeout",
+            Self::Io(_) => "background_io_error",
+        }
+    }
+}
+
 /// Top-level application error surfaced by CLI command execution.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AppError {
@@ -469,6 +517,10 @@ pub enum AppError {
     /// Downloader or artifact verification failure.
     #[error(transparent)]
     Download(#[from] DownloadError),
+
+    /// Background job launch or handshake failure.
+    #[error(transparent)]
+    Background(#[from] BackgroundError),
 
     /// One or more creators failed to refresh while others may have succeeded.
     #[error("{}", format_partial_refresh(*succeeded, failures))]
@@ -489,6 +541,7 @@ impl AppError {
             Self::Storage(err) => err.error_code(),
             Self::Refresh(err) => err.error_code(),
             Self::Download(err) => err.error_code(),
+            Self::Background(err) => err.error_code(),
             Self::RefreshPartialFailure { .. } => "refresh_partial_failure",
         }
     }

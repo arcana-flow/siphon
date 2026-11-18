@@ -8,6 +8,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use crate::domain::{CookieSource, CreatorId, NonEmptyString, PresetName, UploadId};
 use crate::download::{DownloadPlanInput, DownloadTargetInput, PresetSelection};
 use crate::error::ValidationError;
+use crate::jobs::JobId;
 use crate::refresh::RefreshCookiePolicy;
 
 /// Top-level CLI parser for `siphon`.
@@ -100,6 +101,13 @@ pub enum Command {
 
     /// Manage reusable yt-dlp download presets and the active default preset.
     Preset(PresetCommandArgs),
+
+    /// Inspect background job status, progress, and outcomes.
+    Job(JobCommandArgs),
+
+    /// Internal detached worker entrypoint (hidden from CLI help).
+    #[command(name = "__worker", hide = true)]
+    InternalWorker,
 }
 
 /// Container for `siphon creator` subcommands.
@@ -171,6 +179,10 @@ pub struct RefreshArgs {
         conflicts_with_all = ["cookie_source", "save_cookies", "clear_cookies"]
     )]
     pub no_cookies: bool,
+
+    /// Run the refresh in a detached background process and return the job ID immediately.
+    #[arg(long)]
+    pub background: bool,
 }
 
 impl RefreshArgs {
@@ -236,6 +248,10 @@ pub struct DownloadArgs {
     /// Cookie source passed to yt-dlp for this download invocation only.
     #[command(flatten)]
     pub cookies: CookieArgs,
+
+    /// Run the download in a detached background process and return the job ID immediately.
+    #[arg(long)]
+    pub background: bool,
 
     /// One-off arguments passed to yt-dlp after `--` (appended after preset arguments).
     #[arg(last = true, allow_hyphen_values = true, value_name = "YT_DLP_ARGS")]
@@ -361,6 +377,26 @@ pub enum PresetCommand {
         /// Preset name to select as the default (may be `video`).
         #[arg(value_name = "NAME")]
         name: PresetName,
+    },
+}
+
+/// Container for `siphon job` subcommands.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
+pub struct JobCommandArgs {
+    /// Background job query action.
+    #[command(subcommand)]
+    pub command: JobCommand,
+}
+
+/// Subcommands under `siphon job`.
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum JobCommand {
+    /// Inspect the current state, timing, progress, and outcome of a background job.
+    Status {
+        /// Local background job ID to inspect.
+        #[arg(value_name = "ID")]
+        id: JobId,
     },
 }
 

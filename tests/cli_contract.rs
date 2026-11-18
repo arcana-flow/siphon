@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, error::ErrorKind};
-use siphon::cli::{Cli, Command, CreatorCommand, PresetCommand, UploadCommand};
+use siphon::cli::{Cli, Command, CreatorCommand, JobCommand, PresetCommand, UploadCommand};
 use siphon::config::{RuntimeConfig, default_db_path_from_env};
 use siphon::domain::{CookieSource, CreatorId, PresetName, UploadId};
 use siphon::download::{DownloadTargetInput, PresetSelection};
+use siphon::jobs::JobId;
 use siphon::refresh::RefreshCookiePolicy;
 
 #[test]
@@ -153,6 +154,55 @@ fn parses_all_readme_commands() {
             }
         })
     );
+
+    let bg_refresh = Cli::try_parse_from(["siphon", "refresh", "--background"]).unwrap();
+    match bg_refresh.command {
+        Command::Refresh(args) => assert!(args.background),
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let bg_download = Cli::try_parse_from([
+        "siphon",
+        "download",
+        "--background",
+        "https://www.bilibili.com/video/BV1xx",
+        "--",
+        "--background",
+    ])
+    .unwrap();
+    match bg_download.command {
+        Command::Download(args) => {
+            assert!(args.background);
+            assert_eq!(args.extra_args, vec!["--background"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let passthrough_bg = Cli::try_parse_from([
+        "siphon",
+        "download",
+        "https://www.bilibili.com/video/BV1xx",
+        "--",
+        "--background",
+    ])
+    .unwrap();
+    match passthrough_bg.command {
+        Command::Download(args) => {
+            assert!(!args.background);
+            assert_eq!(args.extra_args, vec!["--background"]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let job_status = Cli::try_parse_from(["siphon", "job", "status", "9"]).unwrap();
+    assert_eq!(
+        job_status.command,
+        Command::Job(siphon::cli::JobCommandArgs {
+            command: JobCommand::Status {
+                id: JobId::new(9).unwrap(),
+            }
+        })
+    );
 }
 
 #[test]
@@ -281,6 +331,7 @@ fn rejects_invalid_arguments_and_conflicts() {
         vec!["siphon", "creator"],
         vec!["siphon", "upload"],
         vec!["siphon", "preset"],
+        vec!["siphon", "job"],
     ];
     for argv in missing_subcommands {
         let err = Cli::try_parse_from(argv.clone()).unwrap_err();
@@ -329,6 +380,8 @@ fn rejects_invalid_arguments_and_conflicts() {
         vec!["siphon", "creator", "remove", "abc"],
         vec!["siphon", "upload", "ignore", "0"],
         vec!["siphon", "download", "--upload", "0"],
+        vec!["siphon", "job", "status", "0"],
+        vec!["siphon", "job", "status", "abc"],
         vec!["siphon", "creator", "add", "   "],
         vec!["siphon", "--db", "  ", "creator", "list"],
         vec!["siphon", "preset", "add", "", "--", "-x"],

@@ -4,8 +4,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use clap::error::ErrorKind as ClapErrorKind;
 use serde::Serialize;
-use siphon::app::{AppExecuteOptions, AppServices, execute_with_options};
-use siphon::cli::{Cli, has_json_flag};
+use siphon::app::{AppExecuteOptions, AppServices, execute_with_runtime};
+use siphon::background::{BackgroundRuntime, run_worker_entrypoint};
+use siphon::cli::{Cli, Command, has_json_flag};
 use siphon::config::{RuntimeConfig, resolve_bilibili_api_base};
 use siphon::download::{DownloadExecutionOptions, YtDlpDownloader};
 use siphon::error::AppError;
@@ -44,6 +45,10 @@ fn main() -> ExitCode {
         }
     };
 
+    if matches!(cli.command, Command::InternalWorker) {
+        return run_worker_entrypoint();
+    }
+
     let json_mode = cli.json;
     let render_options = if json_mode {
         HumanRenderOptions::plain()
@@ -80,7 +85,7 @@ fn main() -> ExitCode {
     };
 
     let mut bili_config = BilibiliClientConfig::default();
-    if let Some(base_url) = api_base {
+    if let Some(base_url) = &api_base {
         bili_config = bili_config.with_api_base_url(base_url);
     }
     let refresh_source = BilibiliRefreshSource::with_config(bili_config);
@@ -98,7 +103,8 @@ fn main() -> ExitCode {
             DownloadExecutionOptions::passthrough()
         },
     };
-    let execution = execute_with_options(cli, &services, exec_options);
+    let background_runtime = BackgroundRuntime::with_api_base(api_base);
+    let execution = execute_with_runtime(cli, &services, exec_options, &background_runtime);
 
     if json_mode {
         if let Some(err) = execution.error {

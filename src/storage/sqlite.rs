@@ -31,6 +31,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct SqliteStorage {
     conn: Mutex<Connection>,
+    db_path: Option<PathBuf>,
 }
 
 impl SqliteStorage {
@@ -44,27 +45,24 @@ impl SqliteStorage {
             ));
         }
 
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                StorageError::Backend(format!(
-                    "failed to create database directory '{}': {err}",
-                    parent.display()
-                ))
-            })?;
-        }
-
-        let mut conn = Connection::open(path).map_err(|err| {
+        let resolved_path = resolve_sqlite_db_path(path)?;
+        let mut conn = Connection::open(&resolved_path).map_err(|err| {
             StorageError::Backend(format!(
                 "failed to open SQLite database '{}': {err}",
-                path.display()
+                resolved_path.display()
             ))
         })?;
         configure_connection(&conn, true)?;
         migrations::apply(&mut conn)?;
+        let canonical_path = std::fs::canonicalize(&resolved_path).map_err(|err| {
+            StorageError::Backend(format!(
+                "failed to canonicalize SQLite database '{}': {err}",
+                resolved_path.display()
+            ))
+        })?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: Some(canonical_path),
         })
     }
 
@@ -75,6 +73,7 @@ impl SqliteStorage {
         migrations::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: None,
         })
     }
 
@@ -84,6 +83,7 @@ impl SqliteStorage {
         migrations::apply(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: None,
         })
     }
 
@@ -691,6 +691,14 @@ impl Storage for SqliteStorage {
 
         tx.commit().map_err(map_sqlite_err)
     }
+
+    fn job_store(&self) -> Option<&dyn crate::jobs::JobStore> {
+        Some(self)
+    }
+
+    fn database_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
+    }
 }
 
 impl SqliteStorage {
@@ -1053,6 +1061,88 @@ fn decode_cookie_source(
             "inconsistent refresh_preferences cookie columns: kind={kind:?}, value={value:?}"
         ))),
     }
+}
+
+fn resolve_sqlite_db_path(path: &Path) -> Result<PathBuf, StorageError> {
+    let mut candidate = std::path::absolute(path).map_err(|err| {
+        StorageError::Backend(format!(
+            "failed to resolve database path '{}': {err}",
+            path.display()
+        ))
+    })?;
+
+    for _ in 0..16 {
+        match std::fs::canonicalize(&candidate) {
+            Ok(canonical) => return Ok(canonical),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
+                    && meta.file_type().is_symlink()
+                {
+                    let target = std::fs::read_link(&candidate).map_err(|link_err| {
+                        StorageError::Backend(format!(
+                            "failed to read database symlink '{}': {link_err}",
+                            candidate.display()
+                        ))
+                    })?;
+                    let next = if target.is_absolute() {
+                        target
+                    } else if let Some(parent) = candidate.parent() {
+                        parent.join(target)
+                    } else {
+                        target
+                    };
+                    candidate = std::path::absolute(&next).map_err(|abs_err| {
+                        StorageError::Backend(format!(
+                            "failed to resolve database path '{}': {abs_err}",
+                            next.display()
+                        ))
+                    })?;
+                    continue;
+                }
+
+                let file_name = candidate.file_name().ok_or_else(|| {
+                    StorageError::Backend(format!(
+                        "database path '{}' does not include a file name",
+                        candidate.display()
+                    ))
+                })?;
+                let canonical_parent = match candidate.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => {
+                        std::fs::create_dir_all(parent).map_err(|dir_err| {
+                            StorageError::Backend(format!(
+                                "failed to create database directory '{}': {dir_err}",
+                                parent.display()
+                            ))
+                        })?;
+                        std::fs::canonicalize(parent).map_err(|canon_err| {
+                            StorageError::Backend(format!(
+                                "failed to canonicalize database directory '{}': {canon_err}",
+                                parent.display()
+                            ))
+                        })?
+                    }
+                    _ => {
+                        return Err(StorageError::Backend(format!(
+                            "database path '{}' has no parent directory",
+                            candidate.display()
+                        )));
+                    }
+                };
+                return Ok(canonical_parent.join(file_name));
+            }
+            Err(err) => {
+                return Err(StorageError::Backend(format!(
+                    "failed to resolve database path '{}': {err}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+
+    Err(StorageError::Backend(format!(
+        "database path '{}' exceeds symlink resolution depth",
+        path.display()
+    )))
 }
 
 fn map_sqlite_err(err: rusqlite::Error) -> StorageError {

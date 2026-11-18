@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const KNOWN_LONG_OPTIONS: &[(&str, &str, usize)] = &[
     ("alias", "alias", 2),
@@ -31,8 +33,10 @@ const KNOWN_LONG_OPTIONS: &[(&str, &str, usize)] = &[
     ("list-subs", "list-subs", 0),
     ("list-thumbnails", "list-thumbnails", 0),
     ("load-info-json", "load-info-json", 1),
+    ("newline", "newline", 0),
     ("no-overwrites", "no-overwrites", 0),
     ("no-playlist", "no-playlist", 0),
+    ("no-progress", "no-progress", 0),
     ("no-simulate", "no-simulate", 0),
     ("output", "output", 1),
     ("parse-metadata", "parse-metadata", 2),
@@ -41,6 +45,8 @@ const KNOWN_LONG_OPTIONS: &[(&str, &str, usize)] = &[
     ("ppa", "ppa", 1),
     ("print", "print", 1),
     ("print-to-file", "print-to-file", 2),
+    ("progress", "progress", 0),
+    ("progress-template", "progress-template", 1),
     ("proxy", "proxy", 1),
     ("quiet", "quiet", 0),
     ("referer", "referer", 1),
@@ -109,6 +115,14 @@ fn load_stub_settings() -> HashMap<String, String> {
         "SIPHON_STUB_TITLE",
         "SIPHON_STUB_CREATE_PART",
         "SIPHON_STUB_STDERR_PROGRESS",
+        "SIPHON_STUB_STDOUT_PROGRESS",
+        "SIPHON_STUB_PROGRESS_BYTES",
+        "SIPHON_STUB_READY_FILE",
+        "SIPHON_STUB_PID_FILE",
+        "SIPHON_STUB_READ_STDIN_EXPECT",
+        "SIPHON_STUB_WAIT_FILE",
+        "SIPHON_STUB_POST_READY_FILE",
+        "SIPHON_STUB_POST_WAIT_FILE",
     ] {
         if let Ok(val) = env::var(key) {
             map.insert(key.to_owned(), val);
@@ -172,6 +186,7 @@ struct ParsedArgs {
     list_formats: bool,
     aliases: HashMap<String, Vec<String>>,
     help_or_version: bool,
+    progress_template: Option<String>,
 }
 
 fn resolve_long_option(prefix: &str) -> Result<(&'static str, usize), String> {
@@ -360,6 +375,9 @@ fn parse_token_stream(tokens: &[String], parsed: &mut ParsedArgs) -> Result<(), 
                         template,
                         file: PathBuf::from(unescaped_file),
                     });
+                }
+                "progress-template" => {
+                    parsed.progress_template = Some(get_arg(0)?);
                 }
                 _ => {}
             }
@@ -664,6 +682,77 @@ fn main() -> ExitCode {
         .filter(|s| !s.is_empty())
     {
         eprintln!("{stderr_progress}");
+        let _ = io::stderr().flush();
+    }
+
+    if let Some(stdout_progress) = settings
+        .get("SIPHON_STUB_STDOUT_PROGRESS")
+        .filter(|s| !s.is_empty())
+    {
+        for line in stdout_progress.split("||") {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                println!("{trimmed}");
+            }
+        }
+        let _ = io::stdout().flush();
+    }
+
+    if let Some(bytes_spec) = settings
+        .get("SIPHON_STUB_PROGRESS_BYTES")
+        .filter(|s| !s.is_empty())
+        && let Some((dl_raw, total_raw)) = bytes_spec.split_once(':')
+        && let Some(tpl) = &parsed.progress_template
+    {
+        let body = tpl.strip_prefix("download:").unwrap_or(tpl.as_str());
+        let rendered = body
+            .replace("%(progress.status)j", "\"downloading\"")
+            .replace("%(progress.downloaded_bytes)j", dl_raw.trim())
+            .replace("%(progress.total_bytes)j", total_raw.trim());
+        println!("{rendered}");
+        let _ = io::stdout().flush();
+    }
+
+    if let Some(pid_path) = settings
+        .get("SIPHON_STUB_PID_FILE")
+        .filter(|s| !s.is_empty())
+    {
+        write_artifact(
+            Path::new(pid_path),
+            std::process::id().to_string().as_bytes(),
+        );
+    }
+
+    if let Some(ready_path) = settings
+        .get("SIPHON_STUB_READY_FILE")
+        .filter(|s| !s.is_empty())
+    {
+        write_artifact(Path::new(ready_path), b"ready");
+    }
+
+    if let Some(expected_stdin) = settings
+        .get("SIPHON_STUB_READ_STDIN_EXPECT")
+        .filter(|s| !s.is_empty())
+    {
+        let mut line = String::new();
+        if let Err(err) = io::stdin().read_line(&mut line) {
+            eprintln!("ERROR: failed reading stdin: {err}");
+            return ExitCode::from(1);
+        }
+        if line.trim_end_matches(['\r', '\n']) != expected_stdin {
+            eprintln!("ERROR: unexpected stdin input: {line:?}");
+            return ExitCode::from(1);
+        }
+    }
+
+    if let Some(wait_path) = settings
+        .get("SIPHON_STUB_WAIT_FILE")
+        .filter(|s| !s.is_empty())
+    {
+        let start = Instant::now();
+        while Path::new(wait_path).exists() && start.elapsed() < Duration::from_secs(30) {
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     let simulated = parsed.simulate == Some(true)
@@ -788,6 +877,22 @@ fn main() -> ExitCode {
                         println!("[ExtractAudio] Destination: {}", out_path.display());
                     } else {
                         println!("[Merger] Merging formats into \"{}\"", out_path.display());
+                    }
+                    let _ = io::stdout().flush();
+                }
+                if let Some(post_ready) = settings
+                    .get("SIPHON_STUB_POST_READY_FILE")
+                    .filter(|s| !s.is_empty())
+                {
+                    write_artifact(Path::new(post_ready), b"post");
+                }
+                if let Some(post_wait) = settings
+                    .get("SIPHON_STUB_POST_WAIT_FILE")
+                    .filter(|s| !s.is_empty())
+                {
+                    let start = Instant::now();
+                    while Path::new(post_wait).exists() && start.elapsed() < Duration::from_secs(30) {
+                        thread::sleep(Duration::from_millis(20));
                     }
                 }
             }

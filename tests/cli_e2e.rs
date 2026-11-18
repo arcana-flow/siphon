@@ -71,6 +71,7 @@ struct RecordedHttpRequest {
 struct MockHttpResponse {
     status: u16,
     body: String,
+    location: Option<String>,
 }
 
 impl MockHttpResponse {
@@ -78,6 +79,7 @@ impl MockHttpResponse {
         Self {
             status: 200,
             body: body.into(),
+            location: None,
         }
     }
 
@@ -85,6 +87,15 @@ impl MockHttpResponse {
         Self {
             status,
             body: body.into(),
+            location: None,
+        }
+    }
+
+    fn redirect(status: u16, location: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: String::new(),
+            location: Some(location.into()),
         }
     }
 }
@@ -121,15 +132,22 @@ impl MockBilibiliServer {
                     let resp = router(&req);
                     let reason = match resp.status {
                         200 => "OK",
+                        302 => "Found",
                         404 => "Not Found",
                         500 => "Internal Server Error",
                         502 => "Bad Gateway",
                         _ => "Status",
                     };
+                    let location_hdr = resp
+                        .location
+                        .as_deref()
+                        .map(|loc| format!("Location: {loc}\r\n"))
+                        .unwrap_or_default();
                     let raw = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                         resp.status,
                         reason,
+                        location_hdr,
                         resp.body.len(),
                         resp.body
                     );
@@ -490,13 +508,90 @@ fn help_and_cli_errors_agree_with_readme_through_binary() {
         );
     }
 
-    // Unsafe non-loopback http:// override is rejected cleanly before network I/O.
-    let bad_api = runner.run_raw(
-        &["--db", db_path.to_str().unwrap(), "creator", "list"],
-        &[("SIPHON_BILIBILI_API_BASE", "http://example.com")],
+    // Non-loopback HTTP/HTTPS and non-origin overrides are rejected cleanly before network I/O.
+    for bad_override in [
+        "http://example.com",
+        "https://api.example.test",
+        "https://api.bilibili.com",
+        "http://127.0.0.1:8080/prefix",
+    ] {
+        let bad_api = runner.run_raw(
+            &["--db", db_path.to_str().unwrap(), "creator", "list"],
+            &[("SIPHON_BILIBILI_API_BASE", bad_override)],
+        );
+        assert_eq!(
+            bad_api.status.code(),
+            Some(1),
+            "expected exit code 1 for SIPHON_BILIBILI_API_BASE={bad_override}"
+        );
+        let err = stderr_str(&bad_api);
+        assert!(
+            err.contains("loopback") || err.contains("origin"),
+            "unexpected error for '{bad_override}': {err}"
+        );
+    }
+}
+
+#[test]
+fn cross_origin_redirect_with_cookies_fails_without_forwarding_or_leaking_headers_through_binary() {
+    let nav_json = read_fixture("bilibili/nav_guest.json");
+    let acc_alpha = read_fixture("bilibili/acc_info_946974.json");
+    let bili_cookies = fixture_path("cookies/bilibili_netscape.txt");
+
+    let sink_server = MockBilibiliServer::start(|_req| MockHttpResponse::ok_json("{}"));
+    let redirect_target = format!(
+        "{}/steal?secret=redirect-target-sentinel",
+        sink_server.base_url()
     );
-    assert_eq!(bad_api.status.code(), Some(1));
-    assert!(stderr_str(&bad_api).contains("loopback"));
+    let redirect_target_clone = redirect_target.clone();
+
+    let api_server = MockBilibiliServer::start(move |req| match req.path.as_str() {
+        "/x/web-interface/nav" => MockHttpResponse::ok_json(&nav_json),
+        "/x/space/wbi/acc/info" => MockHttpResponse::ok_json(&acc_alpha),
+        "/x/space/wbi/arc/search" => MockHttpResponse::redirect(302, &redirect_target_clone),
+        _ => MockHttpResponse::status(404, "unknown"),
+    });
+
+    let temp = TempDir::new().unwrap();
+    let work_dir = temp.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = temp.path().join("redirect-check.db");
+    let runner = CliRunner::new(work_dir, db_path, api_server.base_url());
+
+    let add_out = runner.run_with_db_flag(&["creator", "add", "https://space.bilibili.com/946974"]);
+    assert!(add_out.status.success(), "{}", stderr_str(&add_out));
+
+    let refresh_out =
+        runner.run_with_db_flag(&["refresh", "1", "--cookies", bili_cookies.to_str().unwrap()]);
+    assert_eq!(refresh_out.status.code(), Some(1));
+    let err = stderr_str(&refresh_out);
+    assert!(err.contains("302") && err.contains("redirect"), "{err}");
+
+    for secret in [
+        "sanitized-sessdata-token",
+        "sanitized-bili-jct",
+        "SAN-BUVID3-0001",
+        "SESSDATA",
+        "redirect-target-sentinel",
+        sink_server.base_url().as_str(),
+    ] {
+        assert!(
+            !err.contains(secret),
+            "CLI error unexpectedly exposed '{secret}': {err}"
+        );
+    }
+
+    assert!(api_server.requests().iter().any(|r| {
+        r.path == "/x/space/wbi/arc/search"
+            && r.cookie_header
+                .as_deref()
+                .is_some_and(|c| c.contains("SESSDATA=sanitized-sessdata-token"))
+    }));
+    assert!(
+        sink_server.requests().is_empty(),
+        "cross-origin redirect target unexpectedly received requests: {:?}",
+        sink_server.requests()
+    );
 }
 
 #[derive(Default)]

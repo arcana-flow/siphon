@@ -66,9 +66,9 @@ where
 
 /// Resolves an optional Bilibili API base URL override from `SIPHON_BILIBILI_API_BASE`.
 ///
-/// Permits `https://` URLs or loopback `http://` URLs (`localhost`, `127.0.0.1`, `::1`)
-/// so offline fixtures and local mock servers can run against the CLI binary without
-/// exposing cookie headers over non-loopback plaintext HTTP.
+/// Permits only loopback `http://` or `https://` origins (`localhost`, `127.0.0.0/8`, `::1`)
+/// with no path, query, fragment, or credentials so offline CLI fixture runs cannot
+/// route Bilibili requests or saved cookies to non-loopback hosts.
 pub fn resolve_bilibili_api_base() -> Result<Option<String>, String> {
     resolve_bilibili_api_base_from_env(|key| env::var(key).ok())
 }
@@ -99,18 +99,15 @@ where
                 .to_owned(),
         );
     }
+    if !parsed.path().is_empty() && parsed.path() != "/" {
+        return Err(
+            "invalid SIPHON_BILIBILI_API_BASE: path components are not allowed (expected an origin)"
+                .to_owned(),
+        );
+    }
 
-    let Some(host) = parsed.host() else {
-        return Err("invalid SIPHON_BILIBILI_API_BASE: missing host".to_owned());
-    };
     match parsed.scheme() {
-        "https" => {}
-        "http" if is_loopback_host(&host) => {}
-        "http" => {
-            return Err(format!(
-                "invalid SIPHON_BILIBILI_API_BASE '{trimmed}': plaintext http is only allowed for loopback hosts"
-            ));
-        }
+        "http" | "https" => {}
         other => {
             return Err(format!(
                 "invalid SIPHON_BILIBILI_API_BASE '{trimmed}': unsupported scheme '{other}'"
@@ -118,7 +115,16 @@ where
         }
     }
 
-    Ok(Some(trimmed.trim_end_matches('/').to_owned()))
+    let Some(host) = parsed.host() else {
+        return Err("invalid SIPHON_BILIBILI_API_BASE: missing host".to_owned());
+    };
+    if !is_loopback_host(&host) {
+        return Err(format!(
+            "invalid SIPHON_BILIBILI_API_BASE '{trimmed}': only loopback origins (localhost, 127.0.0.1, ::1) are allowed"
+        ));
+    }
+
+    Ok(Some(parsed.origin().ascii_serialization()))
 }
 
 fn is_loopback_host(host: &Host<&str>) -> bool {
@@ -155,13 +161,47 @@ mod tests {
             Some("http://[::1]:8123".to_owned())
         );
         assert_eq!(
-            resolve_bilibili_api_base_from_env(|_| Some("https://api.example.test/".to_owned()))
+            resolve_bilibili_api_base_from_env(|_| Some("https://127.0.0.1:8443/".to_owned()))
                 .unwrap(),
-            Some("https://api.example.test".to_owned())
+            Some("https://127.0.0.1:8443".to_owned())
+        );
+        assert_eq!(
+            resolve_bilibili_api_base_from_env(|_| Some("https://localhost:9443/".to_owned()))
+                .unwrap(),
+            Some("https://localhost:9443".to_owned())
+        );
+        assert_eq!(
+            resolve_bilibili_api_base_from_env(|_| Some("https://[::1]:8443/".to_owned())).unwrap(),
+            Some("https://[::1]:8443".to_owned())
         );
 
+        // Non-loopback HTTP and non-loopback HTTPS must both be rejected.
         assert!(
             resolve_bilibili_api_base_from_env(|_| Some("http://example.com".to_owned())).is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("https://api.example.test/".to_owned()))
+                .is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("https://api.bilibili.com".to_owned()))
+                .is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some(
+                "http://127.0.0.1.evil.com:8080".to_owned()
+            ))
+            .is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some(
+                "https://localhost.evil.com:8443".to_owned()
+            ))
+            .is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://127.0.0.1:8080/api".to_owned()))
+                .is_err()
         );
         assert!(resolve_bilibili_api_base_from_env(|_| Some("not-a-url".to_owned())).is_err());
         assert!(
@@ -174,6 +214,10 @@ mod tests {
         );
         assert!(
             resolve_bilibili_api_base_from_env(|_| Some("http://127.0.0.1:8080?x=1".to_owned()))
+                .is_err()
+        );
+        assert!(
+            resolve_bilibili_api_base_from_env(|_| Some("http://127.0.0.1:8080#frag".to_owned()))
                 .is_err()
         );
     }

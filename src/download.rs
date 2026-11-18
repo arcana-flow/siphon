@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
+use crate::background::{ProcessTrackerConfig, spawn_tracked_command};
 use crate::domain::{CookieSource, PresetName, Upload, UploadId, UploadStatus};
 use crate::error::{AppError, DownloadError, StorageError};
 use crate::jobs::{DownloadProgress, DownloadStage};
@@ -325,6 +326,19 @@ pub trait Downloader: Send + Sync {
         let _ = on_progress;
         self.download_with_options(request, options)
     }
+
+    /// Executes the download with optional OS child-process tracking for reservation/job
+    /// reconciliation when the parent Siphon process dies abruptly.
+    fn download_with_tracking(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+        tracking: Option<&ProcessTrackerConfig>,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<DownloadOutcome, DownloadError> {
+        let _ = tracking;
+        self.download_with_progress(request, options, on_progress)
+    }
 }
 
 /// Placeholder [`Downloader`] implementation used until the `yt-dlp` backend is wired.
@@ -552,6 +566,16 @@ impl Downloader for YtDlpDownloader {
         options: DownloadExecutionOptions,
         on_progress: &mut dyn FnMut(DownloadProgress),
     ) -> Result<DownloadOutcome, DownloadError> {
+        self.download_with_tracking(request, options, None, on_progress)
+    }
+
+    fn download_with_tracking(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+        tracking: Option<&ProcessTrackerConfig>,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<DownloadOutcome, DownloadError> {
         request.validate()?;
         let effective_working_dir = self.resolve_effective_working_dir()?;
         if options.refuse_media_to_stdout {
@@ -626,16 +650,17 @@ impl Downloader for YtDlpDownloader {
         };
         let forward_stderr = !matches!(options.stream_mode, DownloadStreamMode::CaptureSilent);
 
-        let mut child = command.spawn().map_err(|err| {
-            if is_binary_unavailable_error(&err) {
-                DownloadError::DownloaderUnavailable {
-                    binary: self.binary.to_string_lossy().into_owned(),
-                    reason: err.to_string(),
+        let (mut child, child_guard) =
+            spawn_tracked_command(&mut command, tracking).map_err(|err| {
+                if is_binary_unavailable_error(&err) {
+                    DownloadError::DownloaderUnavailable {
+                        binary: self.binary.to_string_lossy().into_owned(),
+                        reason: err.to_string(),
+                    }
+                } else {
+                    DownloadError::Io(format!("failed to execute downloader process: {err}"))
                 }
-            } else {
-                DownloadError::Io(format!("failed to execute downloader process: {err}"))
-            }
-        })?;
+            })?;
 
         let child_stdout = child.stdout.take();
         let child_stderr = child.stderr.take();
@@ -681,6 +706,8 @@ impl Downloader for YtDlpDownloader {
                 };
                 (status_res, attr_paths, last_stdout_err, captured_stderr)
             });
+
+        drop(child_guard);
 
         let status = status.map_err(|err| {
             DownloadError::Io(format!("failed to wait for downloader process: {err}"))
@@ -830,7 +857,20 @@ pub fn execute_resolved_download_with_options(
     request: DownloadRequest,
     options: DownloadExecutionOptions,
 ) -> Result<DownloadExecutionReport, AppError> {
-    let outcome = downloader.download_with_options(&request, options)?;
+    execute_resolved_download_with_tracking(storage, downloader, request, options, None)
+}
+
+/// Executes an already-resolved [`DownloadRequest`] with explicit stream options and optional
+/// child-process tracking for reservation reconciliation, updating pending upload status when
+/// artifacts are confirmed.
+pub fn execute_resolved_download_with_tracking(
+    storage: &dyn Storage,
+    downloader: &dyn Downloader,
+    request: DownloadRequest,
+    options: DownloadExecutionOptions,
+    tracking: Option<&ProcessTrackerConfig>,
+) -> Result<DownloadExecutionReport, AppError> {
+    let outcome = downloader.download_with_tracking(&request, options, tracking, &mut |_| {})?;
     let marked_downloaded = match &request.target {
         DownloadTarget::PendingUpload { upload } if outcome.should_mark_downloaded() => {
             storage.mark_upload_downloaded(upload.id)?;

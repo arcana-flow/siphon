@@ -12,7 +12,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use crate::cli::{DownloadArgs, RefreshArgs};
 use crate::config::resolve_bilibili_api_base;
@@ -24,10 +23,10 @@ use crate::download::{
     DownloadExecutionOptions, DownloadRequest, DownloadTarget, Downloader, YtDlpDownloader,
     ensure_no_media_to_stdout, resolve_download_request,
 };
-use crate::error::{AppError, BackgroundError, StorageError};
+use crate::error::{AppError, BackgroundError, DownloadError, RefreshError, StorageError};
 use crate::jobs::{
     ActiveOperation, CreatorJobOutcome, DisplayUrl, DownloadJobOutcome, DownloadProgress,
-    DownloadStage, ExecutionMode, JobCompletion, JobId, JobLease, JobOutcome, JobProgress,
+    DownloadStage, ExecutionMode, JobCompletion, JobId, JobKind, JobLease, JobOutcome, JobProgress,
     JobRecord, JobState, JobStore, JobTarget, OperationReservation, OperationSlot, OwnershipToken,
     ProcessOwner, ReconcileJobOutcome, RefreshJobOutcome, RefreshProgress, StartJobRequest,
     StartedJob,
@@ -39,7 +38,10 @@ use crate::refresh::{
 };
 use crate::storage::{SqliteStorage, Storage};
 
-pub use process::{ProcessLiveness, check_process_liveness, current_process_owner};
+pub(crate) use process::spawn_tracked_command;
+pub use process::{
+    ProcessLiveness, ProcessTrackerConfig, check_process_liveness, current_process_owner,
+};
 
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_millis(200);
@@ -56,7 +58,7 @@ pub struct BackgroundRuntime {
     pub worker_exe: Option<PathBuf>,
     /// Arguments passed to the worker executable (defaults to `["__worker"]`).
     pub worker_args: Vec<String>,
-    /// Maximum duration to wait for worker ownership acknowledgment before failing startup.
+    /// Maximum duration to wait for worker startup (payload write + ownership ack).
     pub ack_timeout: Duration,
 }
 
@@ -118,6 +120,25 @@ impl<'a> ReservationGuard<'a> {
             reservation: Some(reservation),
         }
     }
+
+    /// Returns the active fencing token for the reserved slot.
+    #[must_use]
+    pub fn owner_token(&self) -> OwnershipToken {
+        self.reservation
+            .as_ref()
+            .expect("reservation is live until Drop")
+            .owner_token
+    }
+
+    /// Returns the recorded OS owner identity for the reserved slot.
+    #[must_use]
+    pub fn owner(&self) -> &ProcessOwner {
+        &self
+            .reservation
+            .as_ref()
+            .expect("reservation is live until Drop")
+            .owner
+    }
 }
 
 impl Drop for ReservationGuard<'_> {
@@ -128,9 +149,11 @@ impl Drop for ReservationGuard<'_> {
     }
 }
 
-/// Acquires an exclusive foreground reservation, reconciling confirmed-dead slot owners.
+/// Acquires an exclusive foreground reservation, reconciling confirmed-dead slot owners and any
+/// tracked child process trees.
 pub fn acquire_reservation_with_reconcile<'a>(
     job_store: &'a dyn JobStore,
+    db_path: Option<&Path>,
     slot: OperationSlot,
 ) -> Result<ReservationGuard<'a>, AppError> {
     let owner = current_process_owner();
@@ -138,7 +161,12 @@ pub fn acquire_reservation_with_reconcile<'a>(
         match job_store.acquire_reservation(slot, owner.clone(), Timestamp::now()) {
             Ok(reservation) => return Ok(ReservationGuard::new(job_store, reservation)),
             Err(StorageError::OperationBusy { active }) => {
-                match check_process_liveness(&active.owner) {
+                match process::check_active_owner_liveness(
+                    &active.owner,
+                    db_path,
+                    Some(active.owner_token),
+                    active.execution_mode,
+                ) {
                     ProcessLiveness::ConfirmedDead { reason } => {
                         let _ = job_store.reconcile_dead_reservation(
                             slot,
@@ -164,13 +192,19 @@ pub fn acquire_reservation_with_reconcile<'a>(
 /// Checks whether `slot` is available, reconciling any confirmed-dead owner before returning.
 pub fn ensure_slot_available_with_reconcile(
     job_store: &dyn JobStore,
+    db_path: Option<&Path>,
     slot: OperationSlot,
 ) -> Result<(), AppError> {
     for _ in 0..MAX_RECONCILE_ATTEMPTS {
         let Some(active) = job_store.get_active_reservation(slot)? else {
             return Ok(());
         };
-        match check_process_liveness(&active.owner) {
+        match process::check_active_owner_liveness(
+            &active.owner,
+            db_path,
+            Some(active.owner_token),
+            active.execution_mode,
+        ) {
             ProcessLiveness::ConfirmedDead { reason } => {
                 let _ = job_store.reconcile_dead_reservation(
                     slot,
@@ -200,13 +234,19 @@ pub fn ensure_slot_available_with_reconcile(
 /// Starts a background job and acquires any required occupancy slot, reconciling dead owners.
 pub fn start_background_job_with_reconcile(
     job_store: &dyn JobStore,
+    db_path: Option<&Path>,
     request: StartJobRequest,
 ) -> Result<StartedJob, AppError> {
     for _ in 0..MAX_RECONCILE_ATTEMPTS {
         match job_store.start_background_job(request.clone()) {
             Ok(started) => return Ok(started),
             Err(StorageError::OperationBusy { active }) => {
-                match check_process_liveness(&active.owner) {
+                match process::check_active_owner_liveness(
+                    &active.owner,
+                    db_path,
+                    Some(active.owner_token),
+                    active.execution_mode,
+                ) {
                     ProcessLiveness::ConfirmedDead { reason } => {
                         let _ = job_store.reconcile_dead_reservation(
                             active.slot,
@@ -226,10 +266,11 @@ pub fn start_background_job_with_reconcile(
     Ok(job_store.start_background_job(request)?)
 }
 
-/// Fetches a job record by ID, marking it `interrupted` if `running` and its owner process is
-/// confirmed gone.
+/// Fetches a job record by ID, marking it `interrupted` if `running` and both its owner process
+/// and any active downloader process tree are confirmed gone.
 pub fn query_job_status_with_reconcile(
     job_store: &dyn JobStore,
+    db_path: Option<&Path>,
     job_id: JobId,
 ) -> Result<JobRecord, AppError> {
     let job = job_store.get_job(job_id)?;
@@ -237,7 +278,12 @@ pub fn query_job_status_with_reconcile(
         return Ok(job);
     }
 
-    match check_process_liveness(&job.owner) {
+    match process::check_active_owner_liveness(
+        &job.owner,
+        db_path,
+        Some(job.owner_token),
+        ExecutionMode::Background,
+    ) {
         ProcessLiveness::ConfirmedDead { reason } => {
             match job_store.reconcile_interrupted_job(
                 job.id,
@@ -269,7 +315,7 @@ pub fn submit_background_refresh(
         .to_path_buf();
 
     let cookie_policy = args.cookie_policy()?;
-    // Validate that an explicit target creator exists and is actively followed before mutating or spawning.
+    // Fast pre-check so invalid creator arguments fail before spawning a worker.
     let _ = resolve_refresh_targets(storage, args.creator_id)?;
 
     let submission_cwd = env::current_dir()
@@ -277,7 +323,7 @@ pub fn submit_background_refresh(
     let (cookies, preference_update) =
         resolve_submission_refresh_cookies(storage, cookie_policy, &submission_cwd)?;
 
-    ensure_slot_available_with_reconcile(job_store, OperationSlot::Refresh)?;
+    ensure_slot_available_with_reconcile(job_store, Some(&db_path), OperationSlot::Refresh)?;
 
     let spec = WorkerLaunchSpec {
         db_path: EncodedPath::from_path(&db_path),
@@ -329,6 +375,7 @@ pub fn submit_background_download(
         DownloadTarget::PendingUpload { upload } => {
             ensure_slot_available_with_reconcile(
                 job_store,
+                Some(&db_path),
                 OperationSlot::UploadDownload(upload.id),
             )?;
         }
@@ -392,6 +439,11 @@ fn absolutize_cookie_source(
     }
 }
 
+enum StartupPipeEvent {
+    StdinDone(io::Result<()>),
+    AckRead(io::Result<Option<String>>),
+}
+
 fn spawn_and_await_worker(
     runtime: &BackgroundRuntime,
     working_dir: &Path,
@@ -416,6 +468,8 @@ fn spawn_and_await_worker(
     cmd.stderr(Stdio::null());
     process::configure_detached_worker_command(&mut cmd);
 
+    let deadline = Instant::now() + runtime.ack_timeout;
+
     let mut child = cmd
         .spawn()
         .map_err(|err| BackgroundError::WorkerSpawnFailed {
@@ -423,36 +477,60 @@ fn spawn_and_await_worker(
             reason: err.to_string(),
         })?;
 
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(err) = stdin.write_all(&payload)
-        && err.kind() != io::ErrorKind::BrokenPipe
-    {
+    let mut stdin = child.stdin.take().ok_or_else(|| {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(BackgroundError::Io(format!(
-            "failed to deliver launch configuration to worker: {err}"
-        ))
-        .into());
-    }
-
+        BackgroundError::Io("worker stdin pipe was unavailable".to_owned())
+    })?;
     let stdout = child.stdout.take().ok_or_else(|| {
         let _ = child.kill();
         let _ = child.wait();
         BackgroundError::Io("worker stdout pipe was unavailable".to_owned())
     })?;
 
-    let (ack_tx, ack_rx) = mpsc::channel();
-    let reader_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        let res = read_bounded_line(&mut reader, &mut line, MAX_ACK_LINE_BYTES)
-            .map(|n| if n == 0 { None } else { Some(line) });
-        let _ = ack_tx.send(res);
+    let (event_tx, event_rx) = mpsc::channel::<StartupPipeEvent>();
+    let writer_tx = event_tx.clone();
+    thread::spawn(move || {
+        let res = stdin.write_all(&payload);
+        drop(stdin);
+        let _ = writer_tx.send(StartupPipeEvent::StdinDone(res));
     });
 
-    match ack_rx.recv_timeout(runtime.ack_timeout) {
-        Ok(Ok(Some(line))) => {
-            let _ = reader_handle.join();
+    let reader_tx = event_tx;
+    let reader_handle = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let res = read_bounded_line(&mut reader, MAX_ACK_LINE_BYTES);
+        let _ = reader_tx.send(StartupPipeEvent::AckRead(res));
+    });
+
+    let ack_line_res = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match event_rx.recv_timeout(remaining) {
+            Ok(StartupPipeEvent::StdinDone(Ok(()))) => {}
+            Ok(StartupPipeEvent::StdinDone(Err(err))) => {
+                // BrokenPipe is expected if the worker returned `WorkerAck::Err` and closed stdin
+                // before draining the payload; wait for `AckRead` to surface that structured error.
+                if err.kind() != io::ErrorKind::BrokenPipe {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BackgroundError::Io(format!(
+                        "failed to deliver launch configuration to worker: {err}"
+                    ))
+                    .into());
+                }
+            }
+            Ok(StartupPipeEvent::AckRead(res)) => break res,
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BackgroundError::WorkerAckTimeout.into());
+            }
+        }
+    };
+
+    let _ = reader_handle.join();
+    match ack_line_res {
+        Ok(Some(line)) => {
             let ack: WorkerAck = serde_json::from_str(line.trim()).map_err(|err| {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -474,8 +552,7 @@ fn spawn_and_await_worker(
                 }
             }
         }
-        Ok(Ok(None)) => {
-            let _ = reader_handle.join();
+        Ok(None) => {
             let status_desc = match child.wait() {
                 Ok(status) => match status.code() {
                     Some(code) => format!("exit code {code}"),
@@ -488,52 +565,48 @@ fn spawn_and_await_worker(
             }
             .into())
         }
-        Ok(Err(err)) => {
-            let _ = reader_handle.join();
+        Err(err) => {
             let _ = child.kill();
             let _ = child.wait();
             Err(BackgroundError::Io(format!("failed reading worker acknowledgment: {err}")).into())
         }
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(BackgroundError::WorkerAckTimeout.into())
-        }
     }
 }
 
-fn read_bounded_line<R: BufRead>(
-    reader: &mut R,
-    out: &mut String,
-    max_bytes: usize,
-) -> io::Result<usize> {
-    let mut total = 0usize;
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut raw = Vec::new();
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(total);
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            break;
         }
         let (consume, done) = match available.iter().position(|&b| b == b'\n') {
             Some(pos) => (pos + 1, true),
             None => (available.len(), false),
         };
-        if total + consume > max_bytes {
+        if raw.len() + consume > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "worker acknowledgment exceeded maximum size",
             ));
         }
-        let slice = &available[..consume];
-        let text = std::str::from_utf8(slice).map_err(|err| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("non-UTF-8 ack: {err}"))
-        })?;
-        out.push_str(text);
-        total += consume;
+        raw.extend_from_slice(&available[..consume]);
         reader.consume(consume);
         if done {
-            return Ok(total);
+            break;
         }
     }
+
+    let text = String::from_utf8(raw).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("non-UTF-8 ack: {}", err.utf8_error()),
+        )
+    })?;
+    Ok(Some(text))
 }
 
 /// Entrypoint invoked inside the detached `siphon __worker` child process.
@@ -586,6 +659,69 @@ fn write_worker_ack(ack: &WorkerAck) -> io::Result<()> {
     stdout.flush()
 }
 
+/// Ensures any job lease acquired during worker startup is failed cleanly (releasing its slot)
+/// whenever a post-claim startup check errors or panics before acknowledgment is sent.
+struct StartupLeaseGuard<'a> {
+    storage: &'a SqliteStorage,
+    lease: Option<JobLease>,
+    kind: JobKind,
+}
+
+impl<'a> StartupLeaseGuard<'a> {
+    fn new(storage: &'a SqliteStorage, lease: JobLease, kind: JobKind) -> Self {
+        Self {
+            storage,
+            lease: Some(lease),
+            kind,
+        }
+    }
+
+    fn lease(&self) -> &JobLease {
+        self.lease.as_ref().expect("lease is live until disarmed")
+    }
+
+    fn fail_and_release(mut self, err: &AppError) {
+        self.finish_failed_inner(&persist_safe_app_error(err));
+    }
+
+    fn disarm(mut self) -> JobLease {
+        self.lease.take().expect("lease is live until disarmed")
+    }
+
+    fn finish_failed_inner(&mut self, safe_reason: &str) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let outcome = match self.kind {
+            JobKind::Refresh => JobOutcome::Refresh(RefreshJobOutcome {
+                creator_outcomes: Vec::new(),
+                error: Some(safe_reason.to_owned()),
+            }),
+            JobKind::UploadDownload | JobKind::DirectDownload => {
+                JobOutcome::Download(DownloadJobOutcome {
+                    confirmed_artifacts: Vec::new(),
+                    marked_downloaded: false,
+                    error: Some(safe_reason.to_owned()),
+                })
+            }
+        };
+        let _ = self.storage.finish_job(
+            &lease,
+            JobCompletion::Failed {
+                progress: None,
+                outcome,
+                finished_at: Timestamp::now(),
+            },
+        );
+    }
+}
+
+impl Drop for StartupLeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.finish_failed_inner("background worker aborted before startup completed");
+    }
+}
+
 enum PreparedWorker {
     Refresh {
         storage: SqliteStorage,
@@ -596,9 +732,11 @@ enum PreparedWorker {
     },
     Download {
         storage: SqliteStorage,
+        db_path: PathBuf,
         lease: JobLease,
+        owner: ProcessOwner,
         working_dir: PathBuf,
-        request: DownloadRequest,
+        request: Box<DownloadRequest>,
         display_url: Option<DisplayUrl>,
     },
 }
@@ -654,11 +792,21 @@ impl PreparedWorker {
             } => execute_refresh_worker(&storage, &lease, api_base, targets, cookies),
             Self::Download {
                 storage,
+                db_path,
                 lease,
+                owner,
                 working_dir,
                 request,
                 display_url,
-            } => execute_download_worker(&storage, &lease, &working_dir, &request, display_url),
+            } => execute_download_worker(
+                &storage,
+                &db_path,
+                &lease,
+                &owner,
+                &working_dir,
+                &request,
+                display_url,
+            ),
         }
     }
 }
@@ -704,8 +852,42 @@ fn prepare_worker() -> Result<PreparedWorker, AppError> {
                 .map_err(AppError::Validation)?;
             let cookies = cookies.map(EncodedCookieSource::into_domain);
 
-            // Re-validate target creator before acquiring ownership so unfollowed creators fail startup.
-            let targets = resolve_refresh_targets(&storage, creator_id)?;
+            // Claim the refresh slot BEFORE resolving targets/checkpoints so no concurrent refresh
+            // can commit newer checkpoints between target resolution and slot ownership.
+            let started = start_background_job_with_reconcile(
+                &storage,
+                Some(&db_path),
+                StartJobRequest {
+                    target: JobTarget::Refresh { creator_id },
+                    owner,
+                    started_at: Timestamp::now(),
+                    initial_progress: None,
+                },
+            )?;
+            let lease_guard = StartupLeaseGuard::new(&storage, started.lease, JobKind::Refresh);
+
+            let targets = match resolve_refresh_targets(&storage, creator_id) {
+                Ok(targets) => targets,
+                Err(err) => {
+                    lease_guard.fail_and_release(&err);
+                    return Err(err);
+                }
+            };
+
+            if let Some(update) = preference_update {
+                let res = match update {
+                    RefreshPreferenceUpdate::Save { source } => {
+                        storage.set_default_refresh_cookies(Some(&source.into_domain()))
+                    }
+                    RefreshPreferenceUpdate::Clear => storage.set_default_refresh_cookies(None),
+                };
+                if let Err(err) = res {
+                    let app_err: AppError = err.into();
+                    lease_guard.fail_and_release(&app_err);
+                    return Err(app_err);
+                }
+            }
+
             let total_creators = targets.len() as u64;
             let first = targets.first();
             let initial_progress = RefreshProgress {
@@ -716,51 +898,28 @@ fn prepare_worker() -> Result<PreparedWorker, AppError> {
                 current_creator_id: first.map(|c| c.creator.id),
                 current_creator_name: first.map(|c| c.creator.display_name.clone()),
             };
-
-            let started = start_background_job_with_reconcile(
-                &storage,
-                StartJobRequest {
-                    target: JobTarget::Refresh { creator_id },
-                    owner,
-                    started_at: Timestamp::now(),
-                    initial_progress: Some(JobProgress::Refresh(initial_progress)),
-                },
-            )?;
-
-            if let Some(update) = preference_update {
-                let res = match update {
-                    RefreshPreferenceUpdate::Save { source } => {
-                        storage.set_default_refresh_cookies(Some(&source.into_domain()))
-                    }
-                    RefreshPreferenceUpdate::Clear => storage.set_default_refresh_cookies(None),
-                };
-                if let Err(err) = res {
-                    let _ = storage.finish_job(
-                        &started.lease,
-                        JobCompletion::Failed {
-                            progress: None,
-                            outcome: JobOutcome::Refresh(RefreshJobOutcome {
-                                creator_outcomes: Vec::new(),
-                                error: Some(err.to_string()),
-                            }),
-                            finished_at: Timestamp::now(),
-                        },
-                    );
-                    return Err(err.into());
-                }
+            if let Err(err) = storage.update_job_progress(
+                lease_guard.lease(),
+                JobProgress::Refresh(initial_progress),
+                Timestamp::now(),
+            ) {
+                let app_err: AppError = err.into();
+                lease_guard.fail_and_release(&app_err);
+                return Err(app_err);
             }
 
+            let lease = lease_guard.disarm();
             Ok(PreparedWorker::Refresh {
                 storage,
-                lease: started.lease,
+                lease,
                 api_base,
                 targets,
                 cookies,
             })
         }
         WorkerOperation::Download { request } => {
-            let request = request.into_domain()?;
-            let (target, display_url) = match &request.target {
+            let mut request = request.into_domain()?;
+            let (initial_target, mut display_url, kind) = match &request.target {
                 DownloadTarget::DirectUrl { url } => {
                     let display = DisplayUrl::sanitize(url)?;
                     (
@@ -768,34 +927,30 @@ fn prepare_worker() -> Result<PreparedWorker, AppError> {
                             url: display.clone(),
                         },
                         Some(display),
+                        JobKind::DirectDownload,
                     )
                 }
                 DownloadTarget::PendingUpload { upload } => {
-                    // Re-verify upload status right before acquiring ownership.
-                    let current_upload = storage.get_upload(upload.id)?;
-                    if current_upload.status != UploadStatus::Pending {
-                        return Err(StorageError::UploadNotPending {
-                            upload_id: upload.id,
-                            status: current_upload.status,
-                        }
-                        .into());
-                    }
-                    let display = DisplayUrl::sanitize(&current_upload.url).ok();
+                    let display = DisplayUrl::sanitize(&upload.url).ok();
                     (
                         JobTarget::UploadDownload {
                             upload_id: upload.id,
                             url: display.clone(),
                         },
                         display,
+                        JobKind::UploadDownload,
                     )
                 }
             };
 
+            // Acquire job ownership (and UploadDownload slot when targeted) BEFORE checking current
+            // upload status so another downloader cannot complete the upload between check & claim.
             let started = start_background_job_with_reconcile(
                 &storage,
+                Some(&db_path),
                 StartJobRequest {
-                    target,
-                    owner,
+                    target: initial_target,
+                    owner: owner.clone(),
                     started_at: Timestamp::now(),
                     initial_progress: Some(JobProgress::Download(DownloadProgress {
                         stage: DownloadStage::Preparing,
@@ -804,12 +959,45 @@ fn prepare_worker() -> Result<PreparedWorker, AppError> {
                     })),
                 },
             )?;
+            let lease_guard = StartupLeaseGuard::new(&storage, started.lease, kind);
 
+            if let DownloadTarget::PendingUpload { upload } = &request.target {
+                let current_upload = match storage.get_upload(upload.id) {
+                    Ok(found) => found,
+                    Err(err) => {
+                        let app_err: AppError = err.into();
+                        lease_guard.fail_and_release(&app_err);
+                        return Err(app_err);
+                    }
+                };
+                if current_upload.status != UploadStatus::Pending {
+                    let app_err: AppError = StorageError::UploadNotPending {
+                        upload_id: current_upload.id,
+                        status: current_upload.status,
+                    }
+                    .into();
+                    lease_guard.fail_and_release(&app_err);
+                    return Err(app_err);
+                }
+                display_url = DisplayUrl::sanitize(&current_upload.url).ok();
+                request.target = DownloadTarget::PendingUpload {
+                    upload: current_upload,
+                };
+                if let Err(err) = request.validate() {
+                    let app_err: AppError = err.into();
+                    lease_guard.fail_and_release(&app_err);
+                    return Err(app_err);
+                }
+            }
+
+            let lease = lease_guard.disarm();
             Ok(PreparedWorker::Download {
                 storage,
-                lease: started.lease,
+                db_path,
+                lease,
+                owner,
                 working_dir,
-                request,
+                request: Box::new(request),
                 display_url,
             })
         }
@@ -898,7 +1086,7 @@ fn execute_refresh_worker(
             CreatorRefreshOutcome::Failed { creator, error } => CreatorJobOutcome::Failed {
                 creator_id: creator.creator.id,
                 display_name: creator.creator.display_name,
-                error: error.to_string(),
+                error: persist_safe_refresh_error(&error),
             },
         })
         .collect();
@@ -942,7 +1130,9 @@ fn execute_refresh_worker(
 
 fn execute_download_worker(
     storage: &SqliteStorage,
+    db_path: &Path,
     lease: &JobLease,
+    owner: &ProcessOwner,
     working_dir: &Path,
     request: &DownloadRequest,
     display_url: Option<DisplayUrl>,
@@ -951,10 +1141,18 @@ fn execute_download_worker(
     let mut last_persisted: Option<DownloadProgress> = None;
     let mut last_persist_at = Instant::now() - PROGRESS_PERSIST_INTERVAL;
     let mut latest_progress: Option<DownloadProgress> = None;
+    let tracking = ProcessTrackerConfig {
+        db_path: Some(db_path.to_path_buf()),
+        owner_token: lease.owner_token,
+        owner: owner.clone(),
+        execution_mode: ExecutionMode::Background,
+        isolate_process_group: false,
+    };
 
-    let download_res = downloader.download_with_progress(
+    let download_res = downloader.download_with_tracking(
         request,
         DownloadExecutionOptions::background_capture(),
+        Some(&tracking),
         &mut |progress| {
             latest_progress = Some(progress.clone());
             let should_persist = match &last_persisted {
@@ -984,7 +1182,6 @@ fn execute_download_worker(
         },
     );
 
-    let raw_url = request.target.url();
     let final_progress = latest_progress.map(JobProgress::Download);
     let finished_at = Timestamp::now();
 
@@ -996,11 +1193,11 @@ fn execute_download_worker(
                         let shown = display_url
                             .as_ref()
                             .map_or("target URL", DisplayUrl::as_str);
-                        format!("downloader reported an unsuccessful outcome for {shown}")
+                        format!("[download_unsuccessful] downloader did not succeed for {shown}")
                     }
                     DownloadTarget::PendingUpload { upload } => format!(
-                        "downloader reported an unsuccessful outcome for upload {} ({}); status remains {}",
-                        upload.id, upload.title, upload.status
+                        "[download_unsuccessful] downloader did not succeed for upload {} (status remains {})",
+                        upload.id, upload.status
                     ),
                 };
                 let _ = storage.finish_job(
@@ -1010,11 +1207,7 @@ fn execute_download_worker(
                         outcome: JobOutcome::Download(DownloadJobOutcome {
                             confirmed_artifacts: outcome.confirmed_artifacts,
                             marked_downloaded: false,
-                            error: Some(sanitize_error_message(
-                                &err_msg,
-                                Some(raw_url),
-                                display_url.as_ref(),
-                            )),
+                            error: Some(err_msg),
                         }),
                         finished_at,
                     },
@@ -1034,11 +1227,7 @@ fn execute_download_worker(
                                     outcome: JobOutcome::Download(DownloadJobOutcome {
                                         confirmed_artifacts: outcome.confirmed_artifacts,
                                         marked_downloaded: false,
-                                        error: Some(sanitize_error_message(
-                                            &err.to_string(),
-                                            Some(raw_url),
-                                            display_url.as_ref(),
-                                        )),
+                                        error: Some(persist_safe_storage_error(&err)),
                                     }),
                                     finished_at,
                                 },
@@ -1066,7 +1255,7 @@ fn execute_download_worker(
                 .is_ok()
         }
         Err(err) => {
-            let msg = sanitize_error_message(&err.to_string(), Some(raw_url), display_url.as_ref());
+            let msg = persist_safe_download_error(&err);
             let _ = storage.finish_job(
                 lease,
                 JobCompletion::Failed {
@@ -1084,34 +1273,126 @@ fn execute_download_worker(
     }
 }
 
-fn sanitize_error_message(
-    raw_msg: &str,
-    raw_url: Option<&str>,
-    display_url: Option<&DisplayUrl>,
-) -> String {
-    let mut sanitized = raw_msg.to_owned();
-    let (Some(raw), Some(display)) = (raw_url, display_url) else {
-        return sanitized;
-    };
-    if raw != display.as_str() {
-        sanitized = sanitized.replace(raw, display.as_str());
-        if let Ok(mut parsed) = Url::parse(raw) {
-            parsed.set_fragment(None);
-            let no_frag = parsed.as_str().to_owned();
-            if no_frag != display.as_str() {
-                sanitized = sanitized.replace(&no_frag, display.as_str());
-            }
-            parsed.set_query(None);
-            let no_query_frag = parsed.as_str().to_owned();
-            if no_query_frag != display.as_str() {
-                sanitized = sanitized.replace(&no_query_frag, display.as_str());
-            }
-            if let Some(password) = parsed.password().filter(|p| !p.is_empty()) {
-                sanitized = sanitized.replace(password, "[REDACTED]");
-            }
+fn persist_safe_app_error(err: &AppError) -> String {
+    match err {
+        AppError::Storage(storage_err) => persist_safe_storage_error(storage_err),
+        AppError::Refresh(refresh_err) => persist_safe_refresh_error(refresh_err),
+        AppError::Download(download_err) => persist_safe_download_error(download_err),
+        AppError::Validation(val_err) => {
+            format!("[{}] input validation failed", val_err.error_code())
+        }
+        AppError::Background(bg) => format!("[{}] background operation failed", bg.error_code()),
+        AppError::RefreshPartialFailure {
+            succeeded,
+            failures,
+        } => {
+            let total = succeeded + failures.len();
+            format!(
+                "[refresh_partial_failure] {} of {total} creator(s) failed during refresh",
+                failures.len()
+            )
         }
     }
-    sanitized
+}
+
+fn persist_safe_storage_error(err: &StorageError) -> String {
+    let code = err.error_code();
+    match err {
+        StorageError::NotImplemented => {
+            format!("[{code}] storage operation is not implemented")
+        }
+        StorageError::CreatorNotFound { creator_id } => {
+            format!("[{code}] creator {creator_id} not found")
+        }
+        StorageError::CreatorAlreadyFollowed { .. } => {
+            format!("[{code}] creator is already followed")
+        }
+        StorageError::CreatorNotFollowed { creator_id } => {
+            format!("[{code}] creator {creator_id} is not followed")
+        }
+        StorageError::UploadNotFound { upload_id } => {
+            format!("[{code}] upload {upload_id} not found")
+        }
+        StorageError::UploadNotPending { upload_id, status } => {
+            format!("[{code}] upload {upload_id} is {status}, expected pending")
+        }
+        StorageError::PresetNotFound { .. } => format!("[{code}] download preset not found"),
+        StorageError::PresetAlreadyExists { .. } => {
+            format!("[{code}] download preset already exists")
+        }
+        StorageError::CannotModifyBuiltinPreset { .. } => {
+            format!("[{code}] built-in preset cannot be modified")
+        }
+        StorageError::StaleRefreshCheckpoint { creator_id } => {
+            format!("[{code}] creator {creator_id} refresh checkpoint changed concurrently")
+        }
+        StorageError::JobNotFound { job_id } => format!("[{code}] job {job_id} not found"),
+        StorageError::OperationBusy { active } => format!(
+            "[{code}] slot '{}' held by {} pid {}",
+            active.slot, active.execution_mode, active.owner.pid
+        ),
+        StorageError::StaleJobOwnership { job_id, slot } => match (job_id, slot) {
+            (Some(id), _) => format!("[{code}] ownership for job {id} is no longer active"),
+            (None, Some(slot)) => {
+                format!("[{code}] ownership for slot '{slot}' is no longer active")
+            }
+            (None, None) => format!("[{code}] job ownership is no longer active"),
+        },
+        StorageError::CorruptedData(_) => {
+            format!("[{code}] stored data violated expected schema invariants")
+        }
+        StorageError::Backend(_) => format!("[{code}] SQLite storage backend error"),
+    }
+}
+
+fn persist_safe_refresh_error(err: &RefreshError) -> String {
+    let code = err.error_code();
+    match err {
+        RefreshError::NotImplemented => {
+            format!("[{code}] refresh backend is not implemented")
+        }
+        RefreshError::InvalidCreatorUrl { .. } => format!("[{code}] creator URL is invalid"),
+        RefreshError::CreatorNotFoundRemote { .. } => {
+            format!("[{code}] creator was not found on remote platform")
+        }
+        RefreshError::CookieSourceInvalid { .. } => {
+            format!("[{code}] refresh cookie source is invalid or unreadable")
+        }
+        RefreshError::Network(_) => {
+            format!("[{code}] network request failed while refreshing creator")
+        }
+        RefreshError::PlatformResponse(_) => {
+            format!("[{code}] remote platform returned an unexpected response")
+        }
+        RefreshError::Storage(storage_err) => persist_safe_storage_error(storage_err),
+    }
+}
+
+fn persist_safe_download_error(err: &DownloadError) -> String {
+    let code = err.error_code();
+    match err {
+        DownloadError::NotImplemented => {
+            format!("[{code}] download backend is not implemented")
+        }
+        DownloadError::DownloaderUnavailable { .. } => {
+            format!("[{code}] downloader executable could not be started")
+        }
+        DownloadError::ProcessFailed { exit_code, .. } => match exit_code {
+            Some(exit) => format!("[{code}] yt-dlp exited with exit code {exit}"),
+            None => format!("[{code}] yt-dlp was terminated by signal"),
+        },
+        DownloadError::CookieSourceInvalid { .. } => {
+            format!("[{code}] download cookie source is invalid or unreadable")
+        }
+        DownloadError::InvalidArguments { .. } => {
+            format!("[{code}] download arguments violated validation rules")
+        }
+        DownloadError::MediaToStdoutDisallowed { .. } => {
+            format!("[{code}] streaming media to stdout is disallowed in background mode")
+        }
+        DownloadError::Io(_) => format!("[{code}] download I/O operation failed"),
+        DownloadError::Storage(storage_err) => persist_safe_storage_error(storage_err),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1519,19 +1800,123 @@ impl WorkerStartupFailure {
 mod tests {
     use super::*;
 
+    struct SplitChunkReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl SplitChunkReader {
+        fn new(chunks: Vec<&[u8]>) -> Self {
+            Self {
+                chunks: chunks.into_iter().map(|c| c.to_vec()).collect(),
+                index: 0,
+            }
+        }
+    }
+
+    impl io::Read for SplitChunkReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let available = self.fill_buf()?;
+            if available.is_empty() {
+                return Ok(0);
+            }
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for SplitChunkReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            while self.index < self.chunks.len() && self.chunks[self.index].is_empty() {
+                self.index += 1;
+            }
+            Ok(self
+                .chunks
+                .get(self.index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]))
+        }
+
+        fn consume(&mut self, amt: usize) {
+            if let Some(chunk) = self.chunks.get_mut(self.index) {
+                chunk.drain(..amt.min(chunk.len()));
+            }
+        }
+    }
+
     #[test]
-    fn sanitize_error_message_redacts_credentials_query_and_fragment() {
-        let raw = "https://alice:s3cr3t@example.com/video/BV1?tok=abc123#frag";
-        let display = DisplayUrl::sanitize(raw).unwrap();
-        let msg = format!(
-            "yt-dlp failed for {raw} and https://alice:s3cr3t@example.com/video/BV1?tok=abc123 with secret s3cr3t"
+    fn persisted_errors_emit_safe_classifications_without_arbitrary_diagnostics() {
+        let dl_err = DownloadError::ProcessFailed {
+            exit_code: Some(1),
+            stderr: "ERROR: https://other.secret/stream?sig=leak99 Cookie: SESSDATA=secret_hdr --cookies /tmp/secret/cookies.txt --proxy http://u:p99@proxy:8080".to_owned(),
+        };
+        let dl_safe = persist_safe_download_error(&dl_err);
+        assert_eq!(
+            dl_safe,
+            "[download_process_failed] yt-dlp exited with exit code 1"
         );
-        let cleaned = sanitize_error_message(&msg, Some(raw), Some(&display));
-        assert!(!cleaned.contains("alice"));
-        assert!(!cleaned.contains("s3cr3t"));
-        assert!(!cleaned.contains("tok=abc123"));
-        assert!(!cleaned.contains("#frag"));
-        assert!(cleaned.contains("https://example.com/video/BV1"));
+        for leak in ["other.secret", "sig=leak99", "SESSDATA", "mycookies", "p99"] {
+            assert!(!dl_safe.contains(leak));
+        }
+
+        let cookie_dl = DownloadError::CookieSourceInvalid {
+            cookie_source: "cookie file '/tmp/secret/mycookies.txt'".to_owned(),
+            reason: "permission denied for secret".to_owned(),
+        };
+        assert_eq!(
+            persist_safe_download_error(&cookie_dl),
+            "[cookie_source_invalid] download cookie source is invalid or unreadable"
+        );
+
+        let refresh_net = RefreshError::Network(
+            "request https://api.secret/x?tok=refresh_secret failed with Cookie: SESSDATA=foo"
+                .to_owned(),
+        );
+        assert_eq!(
+            persist_safe_refresh_error(&refresh_net),
+            "[refresh_network_error] network request failed while refreshing creator"
+        );
+        let refresh_resp = RefreshError::PlatformResponse(
+            "unexpected payload containing Cookie: bar=baz".to_owned(),
+        );
+        assert_eq!(
+            persist_safe_refresh_error(&refresh_resp),
+            "[refresh_platform_error] remote platform returned an unexpected response"
+        );
+
+        let upload_not_pending = StorageError::UploadNotPending {
+            upload_id: UploadId::new(7).unwrap(),
+            status: UploadStatus::Downloaded,
+        };
+        assert_eq!(
+            persist_safe_storage_error(&upload_not_pending),
+            "[upload_not_pending] upload 7 is downloaded, expected pending"
+        );
+    }
+
+    #[test]
+    fn read_bounded_line_decodes_multibyte_utf8_split_across_chunks() {
+        // 4-byte emoji '🦀' (`\xF0\x9F\xA6\x80`) + 3-byte '中' (`\xE4\xB8\xAD`) split mid-codepoint.
+        let full = b"{\"status\":\"ok\",\"note\":\"\xF0\x9F\xA6\x80\xE4\xB8\xAD\"}\n";
+        let split_at = full.iter().position(|&b| b == 0xF0).unwrap() + 2;
+        let split_at_2 = full.iter().position(|&b| b == 0xE4).unwrap() + 1;
+        let mut reader = SplitChunkReader::new(vec![
+            &full[..split_at],
+            &full[split_at..split_at_2],
+            &full[split_at_2..],
+        ]);
+        let decoded = read_bounded_line(&mut reader, 1024).unwrap().unwrap();
+        assert_eq!(decoded, std::str::from_utf8(full).unwrap());
+
+        // Invalid complete frame is still rejected.
+        let mut bad_reader = SplitChunkReader::new(vec![b"{\"bad\":", b"\xFF\n"]);
+        assert!(read_bounded_line(&mut bad_reader, 1024).is_err());
+
+        // Oversized line is rejected.
+        let mut big_reader = SplitChunkReader::new(vec![b"0123456789\n"]);
+        assert!(read_bounded_line(&mut big_reader, 5).is_err());
     }
 
     #[test]

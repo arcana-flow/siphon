@@ -1,17 +1,17 @@
 //! Command dispatch wiring connecting the CLI to storage, refresh, and download services.
 
 use crate::background::{
-    BackgroundRuntime, acquire_reservation_with_reconcile, query_job_status_with_reconcile,
-    submit_background_download, submit_background_refresh,
+    BackgroundRuntime, ProcessTrackerConfig, acquire_reservation_with_reconcile,
+    query_job_status_with_reconcile, submit_background_download, submit_background_refresh,
 };
 use crate::cli::{Cli, Command, CreatorCommand, JobCommand, PresetCommand, UploadCommand};
 use crate::domain::{Timestamp, UploadStatus};
 use crate::download::{
-    DownloadExecutionOptions, DownloadTarget, execute_resolved_download_with_options,
+    DownloadExecutionOptions, DownloadTarget, execute_resolved_download_with_tracking,
     resolve_download_request,
 };
 use crate::error::{AppError, BackgroundError, DownloadError, StorageError};
-use crate::jobs::OperationSlot;
+use crate::jobs::{ExecutionMode, OperationSlot};
 use crate::output::{CommandResult, HumanRenderOptions};
 use crate::refresh::{follow_creator, refresh_creators};
 use crate::storage::Storage;
@@ -179,12 +179,14 @@ fn execute_refresh(
         Err(err) => return CommandExecution::err(err.into()),
     };
     let _reservation_guard = match services.storage.job_store() {
-        Some(job_store) => {
-            match acquire_reservation_with_reconcile(job_store, OperationSlot::Refresh) {
-                Ok(guard) => Some(guard),
-                Err(err) => return CommandExecution::err(err),
-            }
-        }
+        Some(job_store) => match acquire_reservation_with_reconcile(
+            job_store,
+            services.storage.database_path(),
+            OperationSlot::Refresh,
+        ) {
+            Ok(guard) => Some(guard),
+            Err(err) => return CommandExecution::err(err),
+        },
         None => None,
     };
 
@@ -231,13 +233,15 @@ fn execute_download_command(
     }
 
     let plan = args.to_plan_input()?;
-    let request = resolve_download_request(services.storage, plan)?;
+    let mut request = resolve_download_request(services.storage, plan)?;
     request.validate()?;
 
-    let _reservation_guard = match (&request.target, services.storage.job_store()) {
+    let db_path = services.storage.database_path();
+    let (_reservation_guard, tracking) = match (&request.target, services.storage.job_store()) {
         (DownloadTarget::PendingUpload { upload }, Some(job_store)) => {
             let guard = acquire_reservation_with_reconcile(
                 job_store,
+                db_path,
                 OperationSlot::UploadDownload(upload.id),
             )?;
             let current = services.storage.get_upload(upload.id)?;
@@ -248,16 +252,26 @@ fn execute_download_command(
                 }
                 .into());
             }
-            Some(guard)
+            let tracker = ProcessTrackerConfig {
+                db_path: db_path.map(std::path::Path::to_path_buf),
+                owner_token: guard.owner_token(),
+                owner: guard.owner().clone(),
+                execution_mode: ExecutionMode::Foreground,
+                isolate_process_group: true,
+            };
+            request.target = DownloadTarget::PendingUpload { upload: current };
+            request.validate()?;
+            (Some(guard), Some(tracker))
         }
-        _ => None,
+        _ => (None, None),
     };
 
-    let report = execute_resolved_download_with_options(
+    let report = execute_resolved_download_with_tracking(
         services.storage,
         services.downloader,
         request,
         download_options,
+        tracking.as_ref(),
     )?;
     if !report.outcome.succeeded {
         let message = match &report.request.target {
@@ -284,7 +298,7 @@ fn execute_job(command: JobCommand, storage: &dyn Storage) -> Result<CommandResu
     match command {
         JobCommand::Status { id } => {
             let job_store = storage.job_store().ok_or(StorageError::NotImplemented)?;
-            let job = query_job_status_with_reconcile(job_store, id)?;
+            let job = query_job_status_with_reconcile(job_store, storage.database_path(), id)?;
             Ok(CommandResult::JobStatus(job))
         }
     }

@@ -360,6 +360,7 @@ fn spawn_tracked_command_inner(
 
 /// Handle to a detached worker child process spawned for background IPC startup.
 pub(crate) enum WorkerProcess {
+    #[cfg(not(windows))]
     Std(Child),
     #[cfg(windows)]
     Win32(win32_proc::Win32SpawnedChild),
@@ -368,6 +369,7 @@ pub(crate) enum WorkerProcess {
 impl WorkerProcess {
     pub(crate) fn kill(&mut self) -> io::Result<()> {
         match self {
+            #[cfg(not(windows))]
             Self::Std(child) => child.kill(),
             #[cfg(windows)]
             Self::Win32(child) => child.kill(),
@@ -376,6 +378,7 @@ impl WorkerProcess {
 
     pub(crate) fn wait_code(&mut self) -> io::Result<Option<i32>> {
         match self {
+            #[cfg(not(windows))]
             Self::Std(child) => child.wait().map(|status| status.code()),
             #[cfg(windows)]
             Self::Win32(child) => child.wait_code(),

@@ -17,9 +17,10 @@ use serde_json::Value;
 use siphon::app::{AppExecuteOptions, AppServices, execute_with_runtime};
 use siphon::background::BackgroundRuntime;
 use siphon::cli::Cli;
-use siphon::domain::Timestamp;
+use siphon::domain::{Timestamp, UploadStatus};
 use siphon::download::YtDlpDownloader;
-use siphon::error::BackgroundError;
+use siphon::error::{AppError, BackgroundError, StorageError};
+use siphon::output::CommandResult;
 use siphon::platform::bilibili::BilibiliRefreshSource;
 use siphon::storage::SqliteStorage;
 use tempfile::TempDir;
@@ -944,7 +945,8 @@ fn background_uses_submission_cwd_and_resolved_inputs_and_sanitizes_history() {
         expected_artifact.display()
     );
 
-    // Also submit a failing download echoing raw URL + credentials in stderr; verify redaction!
+    // Also submit a failing download echoing raw URL + non-target secrets (another URL, Cookie
+    // header, cookie path, proxy credentials) in stderr; verify safe error classification only!
     let fail_url =
         "https://alice:s3cr3tPass@www.bilibili.com/video/BV1failurl?token=qsecret123#frag";
     let fail_sub = parse_single_json_stdout(&runner.run_with_db_in_dir(
@@ -954,7 +956,9 @@ fn background_uses_submission_cwd_and_resolved_inputs_and_sanitizes_history() {
             ("SIPHON_STUB_MODE", "fail"),
             (
                 "SIPHON_STUB_STDERR",
-                &format!("ERROR: download failed for {fail_url}"),
+                &format!(
+                    "ERROR: download failed for {fail_url} other=https://cdn.evil/stream?sig=OTHER_URL_SECRET Cookie: SESSDATA=HEADER_SECRET_99 --cookies /tmp/secret/OTHER_COOKIES.txt --proxy http://pxu:PROXY_PASS_77@proxy:8080"
+                ),
             ),
         ],
     ));
@@ -963,6 +967,10 @@ fn background_uses_submission_cwd_and_resolved_inputs_and_sanitizes_history() {
         data["state"] != "running"
     });
     assert_eq!(fail_done["state"], "failed");
+    assert_eq!(
+        fail_done["outcome"]["error"],
+        "[download_process_failed] yt-dlp exited with exit code 1"
+    );
 
     // Inspect SQLite `jobs` rows directly: zero sensitive inputs or raw credentials/tokens retained!
     let conn = Connection::open(&db_path).unwrap();
@@ -994,6 +1002,7 @@ fn background_uses_submission_cwd_and_resolved_inputs_and_sanitizes_history() {
             all_job_text.push_str(&o);
         }
     }
+    let fail_done_text = fail_done.to_string();
     for secret in [
         "alice",
         "s3cr3tPass",
@@ -1002,10 +1011,21 @@ fn background_uses_submission_cwd_and_resolved_inputs_and_sanitizes_history() {
         "cookies.txt",
         "SECRET_COOKIE_TOKEN",
         "custom_tpl",
+        "OTHER_URL_SECRET",
+        "cdn.evil",
+        "HEADER_SECRET_99",
+        "SESSDATA",
+        "OTHER_COOKIES.txt",
+        "pxu",
+        "PROXY_PASS_77",
     ] {
         assert!(
             !all_job_text.contains(secret),
             "persisted jobs table retained sensitive input '{secret}': {all_job_text}"
+        );
+        assert!(
+            !fail_done_text.contains(secret),
+            "job status output leaked sensitive input '{secret}': {fail_done_text}"
         );
     }
     for runtime_input in ["rel_dl", dir_a.to_str().unwrap()] {
@@ -1102,6 +1122,7 @@ fn shared_concurrency_conflicts_and_dead_owner_reconciliation_work_end_to_end() 
             MockHttpResponse::ok_json(arc_search_json(&[
                 ("BV1conc01", 101, "Upload 1", feed_ts),
                 ("BV1conc02", 102, "Upload 2", feed_ts + 1),
+                ("BV1conc03", 103, "Upload 3", feed_ts + 2),
             ]))
         }
         _ => MockHttpResponse::status(404, "unknown"),
@@ -1218,9 +1239,10 @@ fn shared_concurrency_conflicts_and_dead_owner_reconciliation_work_end_to_end() 
     // 3. Shared foreground/background upload download conflict & dead-owner reconciliation via `job status`.
     let uploads = parse_single_json_stdout(&runner.run_with_db(&["--json", "upload", "list"]));
     let arr = uploads["data"]["uploads"].as_array().unwrap();
-    assert_eq!(arr.len(), 2);
+    assert_eq!(arr.len(), 3);
     let u1 = arr[0]["id"].as_i64().unwrap().to_string();
     let u2 = arr[1]["id"].as_i64().unwrap().to_string();
+    let u3 = arr[2]["id"].as_i64().unwrap().to_string();
 
     let ready_u1 = temp.path().join("u1.ready");
     let wait_u1 = temp.path().join("u1.wait");
@@ -1266,16 +1288,39 @@ fn shared_concurrency_conflicts_and_dead_owner_reconciliation_work_end_to_end() 
     );
     assert_eq!(u2_done["state"], "succeeded");
 
-    // Kill `u1` worker -> `job status <ID>` marks `interrupted` and frees `upload_download:u1` slot!
+    // Kill ONLY `u1` Siphon worker while real `yt-dlp-stub` child is still live on `wait_u1`.
     kill_process_by_pid(bg_u1_pid);
-    fs::remove_file(&wait_u1).unwrap();
-    let u1_interrupted = parse_single_json_stdout(&runner.run_with_db(&[
-        "--json",
-        "job",
-        "status",
-        &bg_u1_id.to_string(),
-    ]));
-    assert_eq!(u1_interrupted["data"]["state"], "interrupted");
+    #[cfg(unix)]
+    {
+        // Under Unix detached session, active `yt-dlp-stub` child still holds ownership so
+        // concurrent writes to `u1` remain blocked and `job status` stays `running`.
+        let conflict_while_child_alive =
+            runner.run_with_db(&["--json", "download", "--upload", &u1]);
+        assert_eq!(conflict_while_child_alive.status.code(), Some(1));
+        assert_eq!(
+            parse_single_json_stdout(&conflict_while_child_alive)["error"]["code"],
+            "operation_busy"
+        );
+        let status_while_child_alive = parse_single_json_stdout(&runner.run_with_db(&[
+            "--json",
+            "job",
+            "status",
+            &bg_u1_id.to_string(),
+        ]));
+        assert_eq!(status_while_child_alive["data"]["state"], "running");
+        fs::remove_file(&wait_u1).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let _ = fs::remove_file(&wait_u1);
+    }
+
+    // Once active downloader process tree is gone, `job status <ID>` marks `interrupted` and
+    // frees the `upload_download:u1` slot so retry succeeds cleanly.
+    let u1_interrupted = poll_job_until(&runner, bg_u1_id, Duration::from_secs(10), |d| {
+        d["state"] != "running"
+    });
+    assert_eq!(u1_interrupted["state"], "interrupted");
 
     // Resubmission succeeds now that slot is released.
     let u1_retry = parse_single_json_stdout(&runner.run_with_db(&[
@@ -1344,7 +1389,78 @@ fn shared_concurrency_conflicts_and_dead_owner_reconciliation_work_end_to_end() 
     );
     assert_eq!(after_done["state"], "succeeded");
 
-    // 5. Direct URL background job killed mid-flight reconciles cleanly to `interrupted`.
+    // 5. Foreground managed upload (`--upload <u3>`) tracks its `yt-dlp-stub` child process tree:
+    //    killing ONLY the foreground `siphon` keeps ownership while `yt-dlp-stub` is still alive
+    //    on Unix (and tears down the child Job Object on Windows), then cleanly allows retry.
+    let ready_fg_u3 = temp.path().join("fg_u3.ready");
+    let wait_fg_u3 = temp.path().join("fg_u3.wait");
+    fs::write(&wait_fg_u3, b"1").unwrap();
+    let mut fg_dl_child = fg_runner
+        .command_with_db(
+            &["--json", "download", "--upload", &u3],
+            &[
+                ("SIPHON_STUB_READY_FILE", ready_fg_u3.to_str().unwrap()),
+                ("SIPHON_STUB_WAIT_FILE", wait_fg_u3.to_str().unwrap()),
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn foreground managed download");
+    let fg_dl_pid = fg_dl_child.id();
+    wait_for_file(&ready_fg_u3, Duration::from_secs(10));
+
+    let bg_u3_busy =
+        fg_runner.run_with_db(&["--json", "download", "--background", "--upload", &u3]);
+    assert_eq!(bg_u3_busy.status.code(), Some(1));
+    let bg_u3_err = parse_single_json_stdout(&bg_u3_busy);
+    assert_eq!(bg_u3_err["error"]["code"], "operation_busy");
+    assert_eq!(
+        bg_u3_err["error"]["details"]["execution_mode"],
+        "foreground"
+    );
+    assert_eq!(bg_u3_err["error"]["details"]["pid"], fg_dl_pid);
+
+    let _ = fg_dl_child.kill();
+    let _ = fg_dl_child.wait();
+    #[cfg(unix)]
+    {
+        let busy_while_child_alive =
+            fg_runner.run_with_db(&["--json", "download", "--upload", &u3]);
+        assert_eq!(busy_while_child_alive.status.code(), Some(1));
+        assert_eq!(
+            parse_single_json_stdout(&busy_while_child_alive)["error"]["code"],
+            "operation_busy"
+        );
+        fs::remove_file(&wait_fg_u3).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let _ = fs::remove_file(&wait_fg_u3);
+    }
+
+    let retry_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let retry_out = fg_runner.run_with_db(&["--json", "download", "--upload", &u3]);
+        if retry_out.status.success() {
+            let json = parse_single_json_stdout(&retry_out);
+            assert_eq!(json["data"]["marked_downloaded"], true);
+            break;
+        }
+        let err_json = parse_single_json_stdout(&retry_out);
+        assert_eq!(
+            err_json["error"]["code"], "operation_busy",
+            "unexpected retry error: {err_json}"
+        );
+        assert!(
+            Instant::now() < retry_deadline,
+            "timed out waiting for dead foreground child process cleanup"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // 6. Direct URL background job killed mid-flight preserves ownership until `yt-dlp-stub` exits,
+    //    then reconciles cleanly to `interrupted`.
     let ready_direct = temp.path().join("direct_kill.ready");
     let wait_direct = temp.path().join("direct_kill.wait");
     fs::write(&wait_direct, b"1").unwrap();
@@ -1365,14 +1481,25 @@ fn shared_concurrency_conflicts_and_dead_owner_reconciliation_work_end_to_end() 
     let direct_pid = direct_sub["data"]["pid"].as_u64().unwrap() as u32;
     wait_for_file(&ready_direct, Duration::from_secs(10));
     kill_process_by_pid(direct_pid);
-    fs::remove_file(&wait_direct).unwrap();
-    let direct_interrupted = parse_single_json_stdout(&fg_runner.run_with_db(&[
-        "--json",
-        "job",
-        "status",
-        &direct_id.to_string(),
-    ]));
-    assert_eq!(direct_interrupted["data"]["state"], "interrupted");
+    #[cfg(unix)]
+    {
+        let busy_status = parse_single_json_stdout(&fg_runner.run_with_db(&[
+            "--json",
+            "job",
+            "status",
+            &direct_id.to_string(),
+        ]));
+        assert_eq!(busy_status["data"]["state"], "running");
+        fs::remove_file(&wait_direct).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let _ = fs::remove_file(&wait_direct);
+    }
+    let direct_interrupted = poll_job_until(&fg_runner, direct_id, Duration::from_secs(10), |d| {
+        d["state"] != "running"
+    });
+    assert_eq!(direct_interrupted["state"], "interrupted");
 }
 
 #[test]
@@ -1598,23 +1725,49 @@ fn startup_failures_return_command_errors_without_orphaned_jobs() {
         &helper_src,
         r#"
 use std::env;
+use std::fs;
 use std::io::Read;
-use std::process::ExitCode;
+use std::path::Path;
+use std::process::{Command, ExitCode};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
-    let mut buf = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut buf);
     match env::args().nth(1).as_deref() {
-        Some("crash") => ExitCode::from(42),
+        Some("crash") => {
+            let mut buf = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut buf);
+            ExitCode::from(42)
+        }
         Some("bad_ack") => {
+            let mut buf = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut buf);
             println!("not-json-ack");
             ExitCode::SUCCESS
         }
         Some("hang") => {
+            let mut buf = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut buf);
             thread::sleep(Duration::from_secs(10));
             ExitCode::SUCCESS
+        }
+        Some("hang_no_read") => {
+            thread::sleep(Duration::from_secs(10));
+            ExitCode::SUCCESS
+        }
+        Some("gate") => {
+            let args: Vec<String> = env::args().collect();
+            let ready = &args[2];
+            let wait = &args[3];
+            let target = &args[4];
+            let target_args = &args[5..];
+            fs::write(ready, b"ready").unwrap();
+            let start = Instant::now();
+            while Path::new(wait).exists() && start.elapsed() < Duration::from_secs(30) {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let status = Command::new(target).args(target_args).status().unwrap();
+            ExitCode::from(status.code().unwrap_or(1) as u8)
         }
         _ => ExitCode::FAILURE,
     }
@@ -1684,7 +1837,41 @@ fn main() -> ExitCode {
         ))
     ));
 
-    // 3e. In-memory storage cannot run background workers -> UnsupportedStorage.
+    // 3e. Worker that never drains stdin hits WorkerAckTimeout even when launch payload exceeds
+    //     OS pipe buffer (> 256 KiB), proving timeout covers writing stdin as well as reading ack.
+    let big_arg = "x".repeat(300 * 1024);
+    let big_cli = Cli::try_parse_from([
+        "siphon",
+        "download",
+        "--background",
+        "https://example.com/big",
+        "--",
+        &big_arg,
+    ])
+    .unwrap();
+    let no_read_rt = BackgroundRuntime::default()
+        .with_worker_exe(&helper_bin)
+        .with_worker_args(vec!["hang_no_read".to_owned()])
+        .with_ack_timeout(Duration::from_millis(200));
+    let started_write = Instant::now();
+    let no_read_exec = execute_with_runtime(
+        big_cli,
+        &services,
+        AppExecuteOptions::default(),
+        &no_read_rt,
+    );
+    assert!(
+        started_write.elapsed() < Duration::from_secs(4),
+        "stdin write must respect startup timeout"
+    );
+    assert!(matches!(
+        no_read_exec.error,
+        Some(siphon::error::AppError::Background(
+            BackgroundError::WorkerAckTimeout
+        ))
+    ));
+
+    // 3f. In-memory storage cannot run background workers -> UnsupportedStorage.
     let mem_storage = SqliteStorage::open_in_memory().unwrap();
     let mem_services = AppServices {
         storage: &mem_storage,
@@ -1711,4 +1898,225 @@ fn main() -> ExitCode {
         .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn worker_revalidates_state_after_claiming_slot_and_releases_on_startup_failure() {
+    let nav_json = read_fixture("bilibili/nav_guest.json");
+    let acc_alpha = read_fixture("bilibili/acc_info_946974.json");
+    let spi_json = r#"{"code":0,"message":"0","data":{"b_3":"BUVID3","b_4":"BUVID4"}}"#;
+    let base_ts = Timestamp::now().as_unix_seconds() + 100;
+    let phase = Arc::new(AtomicUsize::new(0));
+    let phase_clone = Arc::clone(&phase);
+
+    let server = MockBilibiliServer::start(move |req| match req.path.as_str() {
+        "/x/frontend/finger/spi" => MockHttpResponse::ok_json(spi_json),
+        "/x/web-interface/nav" => MockHttpResponse::ok_json(&nav_json),
+        "/x/space/wbi/acc/info" => MockHttpResponse::ok_json(&acc_alpha),
+        "/x/space/wbi/arc/search" => {
+            let body = if phase_clone.load(Ordering::SeqCst) == 0 {
+                arc_search_json(&[("BV1race01", 101, "Race 1", base_ts + 10)])
+            } else {
+                arc_search_json(&[
+                    ("BV1race02", 102, "Race 2", base_ts + 20),
+                    ("BV1race01", 101, "Race 1", base_ts + 10),
+                ])
+            };
+            MockHttpResponse::ok_json(body)
+        }
+        _ => MockHttpResponse::status(404, "unknown"),
+    });
+
+    let temp = TempDir::new().unwrap();
+    let work_dir = temp.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+    let db_path = temp.path().join("siphon.db");
+    let runner = CliRunner::new(work_dir.clone(), db_path.clone(), server.base_url());
+    let siphon_bin = PathBuf::from(env!("CARGO_BIN_EXE_siphon"));
+
+    let gate_src = temp.path().join("gate_worker.rs");
+    let gate_bin = temp
+        .path()
+        .join(format!("gate_worker{}", env::consts::EXE_SUFFIX));
+    fs::write(
+        &gate_src,
+        r#"
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::process::{Command, ExitCode};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().collect();
+    let ready = &args[1];
+    let wait = &args[2];
+    let target = &args[3];
+    let target_args = &args[4..];
+    fs::write(ready, b"ready").unwrap();
+    let start = Instant::now();
+    while Path::new(wait).exists() && start.elapsed() < Duration::from_secs(30) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let status = Command::new(target).args(target_args).status().unwrap();
+    ExitCode::from(status.code().unwrap_or(1) as u8)
+}
+"#,
+    )
+    .unwrap();
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compile = Command::new(rustc)
+        .arg("--edition=2024")
+        .arg(&gate_src)
+        .arg("-o")
+        .arg(&gate_bin)
+        .output()
+        .unwrap();
+    assert!(compile.status.success());
+
+    assert!(
+        runner
+            .run_with_db(&[
+                "--json",
+                "creator",
+                "add",
+                "https://space.bilibili.com/946974"
+            ])
+            .status
+            .success()
+    );
+    assert!(runner.run_with_db(&["--json", "refresh"]).status.success());
+    let uploads = parse_single_json_stdout(&runner.run_with_db(&["--json", "upload", "list"]));
+    let upload_id = uploads["data"]["uploads"][0]["id"].as_i64().unwrap();
+
+    // 1. Background download spawned while upload is `pending`, paused BEFORE claiming slot;
+    //    meanwhile foreground downloads and completes the upload -> worker claims slot, sees
+    //    UploadNotPending, releases slot and fails startup cleanly without double-downloading.
+    let dl_ready = temp.path().join("dl_gate.ready");
+    let dl_wait = temp.path().join("dl_gate.wait");
+    fs::write(&dl_wait, b"1").unwrap();
+    let dl_db = db_path.clone();
+    let dl_gate = gate_bin.clone();
+    let dl_siphon = siphon_bin.clone();
+    let dl_ready_clone = dl_ready.clone();
+    let dl_wait_clone = dl_wait.clone();
+    let dl_handle = thread::spawn(move || {
+        let storage = SqliteStorage::open(&dl_db).unwrap();
+        let refresh_src = BilibiliRefreshSource::new();
+        let downloader = YtDlpDownloader::new();
+        let services = AppServices {
+            storage: &storage,
+            refresh_source: &refresh_src,
+            downloader: &downloader,
+        };
+        let cli = Cli::try_parse_from([
+            "siphon",
+            "download",
+            "--background",
+            "--upload",
+            &upload_id.to_string(),
+        ])
+        .unwrap();
+        let rt = BackgroundRuntime::default()
+            .with_worker_exe(&dl_gate)
+            .with_worker_args(vec![
+                dl_ready_clone.to_string_lossy().into_owned(),
+                dl_wait_clone.to_string_lossy().into_owned(),
+                dl_siphon.to_string_lossy().into_owned(),
+                "__worker".to_owned(),
+            ]);
+        execute_with_runtime(cli, &services, AppExecuteOptions::default(), &rt)
+    });
+
+    wait_for_file(&dl_ready, Duration::from_secs(10));
+    let fg_dl = runner.run_with_db(&["--json", "download", "--upload", &upload_id.to_string()]);
+    assert!(
+        fg_dl.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fg_dl.stderr)
+    );
+    fs::remove_file(&dl_wait).unwrap();
+
+    let bg_dl_exec = dl_handle.join().unwrap();
+    assert!(matches!(
+        bg_dl_exec.error,
+        Some(AppError::Storage(StorageError::UploadNotPending {
+            status: UploadStatus::Downloaded,
+            ..
+        }))
+    ));
+    let conn = Connection::open(&db_path).unwrap();
+    let active_res: i64 = conn
+        .query_row("SELECT COUNT(*) FROM operation_reservations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(active_res, 0);
+    let running_jobs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(running_jobs, 0);
+    drop(conn);
+
+    // 2. Background refresh spawned at checkpoint T1, paused BEFORE claiming Refresh slot;
+    //    meanwhile foreground refresh advances checkpoint to T2 -> worker resolves targets &
+    //    checkpoints AFTER taking Refresh slot and observes `previous_checkpoint == T2`.
+    phase.store(1, Ordering::SeqCst);
+    let ref_ready = temp.path().join("ref_gate.ready");
+    let ref_wait = temp.path().join("ref_gate.wait");
+    fs::write(&ref_wait, b"1").unwrap();
+    let ref_db = db_path.clone();
+    let ref_api = server.base_url();
+    let ref_ready_clone = ref_ready.clone();
+    let ref_wait_clone = ref_wait.clone();
+    let ref_handle = thread::spawn(move || {
+        let storage = SqliteStorage::open(&ref_db).unwrap();
+        let refresh_src = BilibiliRefreshSource::new();
+        let downloader = YtDlpDownloader::new();
+        let services = AppServices {
+            storage: &storage,
+            refresh_source: &refresh_src,
+            downloader: &downloader,
+        };
+        let cli = Cli::try_parse_from(["siphon", "refresh", "--background"]).unwrap();
+        let rt = BackgroundRuntime::with_api_base(Some(ref_api))
+            .with_worker_exe(&gate_bin)
+            .with_worker_args(vec![
+                ref_ready_clone.to_string_lossy().into_owned(),
+                ref_wait_clone.to_string_lossy().into_owned(),
+                siphon_bin.to_string_lossy().into_owned(),
+                "__worker".to_owned(),
+            ]);
+        execute_with_runtime(cli, &services, AppExecuteOptions::default(), &rt)
+    });
+
+    wait_for_file(&ref_ready, Duration::from_secs(10));
+    // Foreground refresh commits BV1race02 at `base_ts + 20`.
+    assert!(runner.run_with_db(&["--json", "refresh"]).status.success());
+    fs::remove_file(&ref_wait).unwrap();
+
+    let bg_ref_exec = ref_handle.join().unwrap();
+    assert_eq!(bg_ref_exec.error, None);
+    let bg_ref_job = match bg_ref_exec.result {
+        Some(CommandResult::JobStarted(job)) => job,
+        other => panic!("expected JobStarted, got {other:?}"),
+    };
+    let bg_ref_done = poll_job_until(
+        &runner,
+        bg_ref_job.id.as_i64(),
+        Duration::from_secs(10),
+        |d| d["state"] != "running",
+    );
+    assert_eq!(bg_ref_done["state"], "succeeded");
+    let creator_outcome = &bg_ref_done["outcome"]["creator_outcomes"][0];
+    assert_eq!(
+        creator_outcome["previous_checkpoint"],
+        Timestamp::from_unix_seconds(base_ts + 20).format_utc_iso()
+    );
+    assert_eq!(creator_outcome["new_uploads_inserted"], 0);
 }

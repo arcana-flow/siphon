@@ -1,0 +1,310 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+      commit_sha: ${{ steps.validate.outputs.commit_sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag and commit
+        id: validate
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Validate tag format strictly: vX.Y.Z (stable release tag without prerelease suffix)
+          if ! [[ "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Error: Tag '$TAG_NAME' is not a valid stable release tag format (vX.Y.Z)." >&2
+            exit 1
+          fi
+
+          EXPECTED_VERSION="${TAG_NAME#v}"
+
+          # Reject release tags whose version differs from Cargo.toml package version
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "siphon") | .version')
+          if [ "$CARGO_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "Error: Tag version '$EXPECTED_VERSION' does not match Cargo.toml package version '$CARGO_VERSION'." >&2
+            exit 1
+          fi
+
+          # Resolve immutable event commit strictly from EVENT_SHA without mutable fallbacks
+          EVENT_COMMIT=$(git rev-parse --verify "${EVENT_SHA}^{commit}")
+          echo "Immutable event commit: $EVENT_COMMIT"
+
+          # Fetch master and the remote tag into distinct explicit refs
+          git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+          git update-ref -d "refs/verify/${TAG_NAME}" 2>/dev/null || true
+          git fetch --no-tags origin "refs/tags/${TAG_NAME}:refs/verify/${TAG_NAME}"
+          REMOTE_TAG_COMMIT=$(git rev-parse --verify "refs/verify/${TAG_NAME}^{commit}")
+          if [ "$REMOTE_TAG_COMMIT" != "$EVENT_COMMIT" ]; then
+            echo "Error: Remote tag '$TAG_NAME' commit ($REMOTE_TAG_COMMIT) does not match event commit ($EVENT_COMMIT)." >&2
+            exit 1
+          fi
+
+          # Reject release tags whose tagged commit is outside current origin/master history
+          if ! git merge-base --is-ancestor "$EVENT_COMMIT" origin/master; then
+            echo "Error: Tagged commit '$EVENT_COMMIT' is not an ancestor of origin/master history." >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$EVENT_COMMIT" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: CI checks
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.commit_sha }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            os_name: linux
+            arch: x86_64
+            archive_format: tar.gz
+            bin_name: siphon
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            os_name: macos
+            arch: x86_64
+            archive_format: tar.gz
+            bin_name: siphon
+          - os: macos-15
+            target: aarch64-apple-darwin
+            os_name: macos
+            arch: aarch64
+            archive_format: tar.gz
+            bin_name: siphon
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            os_name: windows
+            arch: x86_64
+            archive_format: zip
+            bin_name: siphon.exe
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Run CLI smoke checks (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          chmod +x "$BIN"
+
+          VERSION_OUT=$("$BIN" --version)
+          if [ "$VERSION_OUT" != "siphon $EXPECTED_VERSION" ]; then
+            echo "Error: Unexpected --version output '$VERSION_OUT' (expected 'siphon $EXPECTED_VERSION')." >&2
+            exit 1
+          fi
+
+          HELP_OUT=$("$BIN" --help)
+          printf '%s\n' "$HELP_OUT" | grep -qF "Usage: siphon"
+
+          "$BIN" --db "$RUNNER_TEMP/smoke.db" preset list
+
+      - name: Run CLI smoke checks (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Bin = "target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          $Expected = "siphon $($env:EXPECTED_VERSION)"
+
+          $VersionOut = (& $Bin --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "--version exited with code $LASTEXITCODE"
+          }
+          if ($VersionOut -ne $Expected) {
+            throw "Unexpected --version output '$VersionOut' (expected '$Expected')."
+          }
+
+          $HelpOut = (& $Bin --help | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "--help exited with code $LASTEXITCODE"
+          }
+          if ($HelpOut -notmatch '(?m)^Usage: siphon') {
+            throw "Unexpected --help output: missing 'Usage: siphon'."
+          }
+
+          & $Bin --db "$env:RUNNER_TEMP\smoke.db" preset list
+          if ($LASTEXITCODE -ne 0) {
+            throw "preset list exited with code $LASTEXITCODE"
+          }
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          STAGING="staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGING/"
+          cp README.md "$STAGING/"
+          chmod 755 "$STAGING/${{ matrix.bin_name }}"
+
+          ARCHIVE_NAME="siphon-${TAG_NAME}-${{ matrix.os_name }}-${{ matrix.arch }}.${{ matrix.archive_format }}"
+          mkdir -p dist
+          tar -czf "dist/$ARCHIVE_NAME" -C "$STAGING" "${{ matrix.bin_name }}" README.md
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Staging = "staging"
+          if (Test-Path $Staging) { Remove-Item -Recurse -Force $Staging }
+          New-Item -ItemType Directory -Force -Path $Staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination $Staging
+          Copy-Item "README.md" -Destination $Staging
+
+          $ArchiveName = "siphon-$($env:TAG_NAME)-${{ matrix.os_name }}-${{ matrix.arch }}.${{ matrix.archive_format }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "$Staging\*" -DestinationPath "dist\$ArchiveName" -Force
+
+      - name: Upload build archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: dist/*
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, ci, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download all build archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ needs.validate.outputs.tag }}
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+
+          verify_remote_tag() {
+            git update-ref -d "refs/verify/${TAG_NAME}" 2>/dev/null || true
+            git fetch --no-tags origin "refs/tags/${TAG_NAME}:refs/verify/${TAG_NAME}"
+            REMOTE_TAG_COMMIT=$(git rev-parse --verify "refs/verify/${TAG_NAME}^{commit}")
+            if [ "$REMOTE_TAG_COMMIT" != "$EXPECTED_COMMIT" ]; then
+              echo "Error: Remote tag '$TAG_NAME' commit ($REMOTE_TAG_COMMIT) does not match expected commit ($EXPECTED_COMMIT)." >&2
+              exit 1
+            fi
+          }
+
+          # Guard against moved or deleted tag before publishing
+          verify_remote_tag
+
+          cd dist
+          ARCHIVE_COUNT=$(ls -1 siphon-*.tar.gz siphon-*.zip 2>/dev/null | wc -l)
+          if [ "$ARCHIVE_COUNT" -ne 4 ]; then
+            echo "Error: Expected 4 release archives, found $ARCHIVE_COUNT." >&2
+            exit 1
+          fi
+
+          sha256sum siphon-*.tar.gz siphon-*.zip > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+          ASSETS=(siphon-*.tar.gz siphon-*.zip SHA256SUMS)
+          echo "Assets ready for release: ${ASSETS[*]}"
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            IS_DRAFT=$(gh release view "$TAG_NAME" --json isDraft -q .isDraft)
+            if [ "$IS_DRAFT" = "false" ]; then
+              echo "Release $TAG_NAME is already published; leaving already-public assets untouched."
+              exit 0
+            fi
+            echo "Repairing unfinished draft release $TAG_NAME..."
+            gh release upload "$TAG_NAME" "${ASSETS[@]}" --clobber
+            verify_remote_tag
+            echo "Publishing repaired release $TAG_NAME..."
+            gh release edit "$TAG_NAME" --draft=false
+          else
+            echo "Creating draft release for $TAG_NAME with all assets..."
+            gh release create "$TAG_NAME" "${ASSETS[@]}" \
+              --target "$EXPECTED_COMMIT" \
+              --draft \
+              --verify-tag \
+              --generate-notes \
+              --title "$TAG_NAME"
+            verify_remote_tag
+            echo "Publishing release $TAG_NAME..."
+            gh release edit "$TAG_NAME" --draft=false
+          fi

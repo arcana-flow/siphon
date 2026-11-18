@@ -216,75 +216,6 @@ impl DownloadRequest {
         }
         Ok(())
     }
-
-    /// Returns `true` when forwarded `yt-dlp` options request machine-readable, listing, help,
-    /// or streamed output on stdout so Siphon must not append a summary line to stdout.
-    #[must_use]
-    pub fn preserves_passthrough_stdout(&self) -> bool {
-        let forwarded = self.forward_args();
-        let mut i = 0usize;
-        while i < forwarded.len() {
-            let arg = &forwarded[i];
-            if arg == "--" {
-                break;
-            }
-            if !arg.starts_with('-') || arg == "-" {
-                i += 1;
-                continue;
-            }
-            if let Some(rest) = arg.strip_prefix("--") {
-                let (flag_name, inline_value) = match rest.split_once('=') {
-                    Some((name, val)) => (name, Some(val)),
-                    None => (rest, None),
-                };
-                if is_passthrough_stdout_long_flag(flag_name) {
-                    return true;
-                }
-                if is_output_long_flag(flag_name) {
-                    let target = inline_value.or_else(|| forwarded.get(i + 1).map(String::as_str));
-                    if target == Some("-") {
-                        return true;
-                    }
-                }
-                if inline_value.is_none() {
-                    i += 1 + known_arity_for_passthrough_scan(flag_name);
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-
-            let shorts = &arg[1..];
-            let mut extra_consumed = 0usize;
-            for (idx, ch) in shorts.char_indices() {
-                if matches!(ch, 'h' | 'j' | 'J' | 'O' | 'g' | 'e' | 'F') {
-                    return true;
-                }
-                if ch == 'o' {
-                    let inline = &shorts[idx + ch.len_utf8()..];
-                    let val = if inline.is_empty() {
-                        extra_consumed = 1;
-                        forwarded.get(i + 1).map(String::as_str)
-                    } else {
-                        Some(inline)
-                    };
-                    if val == Some("-") {
-                        return true;
-                    }
-                    break;
-                }
-                if allowed_short_option_arity(ch) == Some(1) || ch == 'a' {
-                    let has_inline = idx + ch.len_utf8() < shorts.len();
-                    if !has_inline {
-                        extra_consumed = 1;
-                    }
-                    break;
-                }
-            }
-            i += 1 + extra_consumed;
-        }
-        false
-    }
 }
 
 /// Outcome returned by a [`Downloader`] after running `yt-dlp` and checking artifacts.
@@ -1166,68 +1097,6 @@ fn known_arity_for_passthrough_scan(flag_name: &str) -> usize {
         "alias" => 2,
         other => allowed_long_option_arity(other).unwrap_or(0),
     }
-}
-
-fn is_passthrough_stdout_long_flag(flag_name: &str) -> bool {
-    const STDOUT_FLAGS: &[&str] = &[
-        "help",
-        "version",
-        "dump-json",
-        "dump-single-json",
-        "dump-user-agent",
-        "print",
-        "get-url",
-        "get-title",
-        "get-id",
-        "get-thumbnail",
-        "get-description",
-        "get-duration",
-        "get-filename",
-        "get-format",
-        "list-formats",
-        "list-subs",
-        "list-thumbnails",
-        "list-extractors",
-        "extractor-descriptions",
-    ];
-    if STDOUT_FLAGS.contains(&flag_name) {
-        return true;
-    }
-    // Also honor unambiguous optparse prefix abbreviations for passthrough stdout flags.
-    matches!(
-        flag_name,
-        "dump-j"
-            | "dump-js"
-            | "dump-jso"
-            | "dump-s"
-            | "dump-si"
-            | "dump-sin"
-            | "dump-sing"
-            | "dump-singl"
-            | "dump-single"
-            | "dump-single-"
-            | "dump-single-j"
-            | "dump-single-js"
-            | "dump-single-jso"
-            | "dump-u"
-            | "list-f"
-            | "list-fo"
-            | "list-for"
-            | "list-form"
-            | "list-forma"
-            | "list-format"
-            | "list-s"
-            | "list-su"
-            | "list-sub"
-            | "list-t"
-            | "list-th"
-            | "list-e"
-            | "list-ex"
-    )
-}
-
-fn is_output_long_flag(flag_name: &str) -> bool {
-    flag_name == "output" || flag_name == "outpu" || flag_name == "outp"
 }
 
 fn has_info_only_exit_flag(args: &[String]) -> bool {
@@ -2538,37 +2407,5 @@ mod tests {
             &upload,
             &[],
         ));
-    }
-
-    #[test]
-    fn detects_passthrough_stdout_flags_without_false_positives() {
-        let direct = |extra: &[&str]| DownloadRequest {
-            target: DownloadTarget::DirectUrl {
-                url: "https://www.bilibili.com/video/BV1test".to_owned(),
-            },
-            preset_name: None,
-            preset_args: Vec::new(),
-            extra_args: extra.iter().map(|s| (*s).to_owned()).collect(),
-            cookies: None,
-        };
-
-        assert!(direct(&["-J"]).preserves_passthrough_stdout());
-        assert!(direct(&["--dump-json"]).preserves_passthrough_stdout());
-        assert!(direct(&["--dump-single"]).preserves_passthrough_stdout());
-        assert!(direct(&["--print", "title"]).preserves_passthrough_stdout());
-        assert!(direct(&["--print=id"]).preserves_passthrough_stdout());
-        assert!(direct(&["-F"]).preserves_passthrough_stdout());
-        assert!(direct(&["--list-formats"]).preserves_passthrough_stdout());
-        assert!(direct(&["--list-form"]).preserves_passthrough_stdout());
-        assert!(direct(&["--help"]).preserves_passthrough_stdout());
-        assert!(direct(&["-h"]).preserves_passthrough_stdout());
-        assert!(direct(&["-o", "-"]).preserves_passthrough_stdout());
-        assert!(direct(&["--output=-"]).preserves_passthrough_stdout());
-
-        assert!(!direct(&[]).preserves_passthrough_stdout());
-        assert!(!direct(&["--simulate"]).preserves_passthrough_stdout());
-        assert!(!direct(&["-s"]).preserves_passthrough_stdout());
-        assert!(!direct(&["--print-to-file", "title", "out.txt"]).preserves_passthrough_stdout());
-        assert!(!direct(&["-o", "video.%(ext)s"]).preserves_passthrough_stdout());
     }
 }

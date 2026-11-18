@@ -421,7 +421,23 @@ impl RefreshSource for NoopRefreshSource {
 
 fn run_cli(services: &AppServices<'_>, argv: &[&str]) -> Result<String, AppError> {
     let cli = Cli::try_parse_from(argv).expect("CLI argv must parse");
-    execute(cli, services).map(|out| out.stdout)
+    let is_download = matches!(cli.command, siphon::cli::Command::Download(_));
+    let out = execute(cli, services)?;
+    if is_download {
+        assert!(
+            out.stdout.is_empty(),
+            "download command must keep CommandOutput.stdout transparent, got: {:?}",
+            out.stdout
+        );
+        Ok(out.stderr)
+    } else {
+        assert!(
+            out.stderr.is_empty(),
+            "non-download command unexpectedly wrote CommandOutput.stderr: {:?}",
+            out.stderr
+        );
+        Ok(out.stdout)
+    }
 }
 
 fn assert_manifest_prefix_and_tail(args: &[String], expected_tail: &[&str]) {
@@ -531,7 +547,7 @@ fn preserves_argv_order_no_preset_and_shell_metacharacters_without_shell() {
     )
     .unwrap();
 
-    // `--help` passthrough omits `--print-to-file` injection and avoids polluting stdout with a summary.
+    // `--help` passthrough omits `--print-to-file` injection and routes Siphon's summary to stderr.
     let help_out = run_cli(
         &services,
         &[
@@ -544,7 +560,7 @@ fn preserves_argv_order_no_preset_and_shell_metacharacters_without_shell() {
         ],
     )
     .unwrap();
-    assert!(help_out.is_empty());
+    assert!(help_out.contains("without confirmed output artifact"));
 
     let logs = read_stub_log(&log_path);
     assert_eq!(logs.len(), 3);
@@ -1054,11 +1070,7 @@ fn simulation_leaves_upload_pending_even_when_old_file_exists_on_disk() {
             ],
         )
         .unwrap();
-        if flag == "--dump-json" {
-            assert!(out.is_empty());
-        } else {
-            assert!(out.contains("remains pending"));
-        }
+        assert!(out.contains("remains pending"));
         assert_eq!(
             storage.get_upload(upload.id).unwrap().status,
             UploadStatus::Pending
@@ -1358,6 +1370,8 @@ fn child_cli_passthrough_harness() {
         Ok(output) => {
             print!("{}", output.stdout);
             let _ = std::io::stdout().flush();
+            eprint!("{}", output.stderr);
+            let _ = std::io::stderr().flush();
             println!("<<<SIPHON_END>>>");
             let _ = std::io::stdout().flush();
         }
@@ -1509,7 +1523,7 @@ fn preserves_machine_readable_stdout_and_streams_normal_stdout_and_stderr_progre
     assert!(help_stdout.contains("yt-dlp stub"));
     assert!(!help_stdout.contains("Finished direct URL"));
 
-    // 3. Normal direct download preserves yt-dlp stdout + stderr progress AND appends Siphon summary.
+    // 3. Normal direct download preserves yt-dlp stdout and routes Siphon summary + progress to stderr.
     write_stub_config(
         &work_dir,
         &[(
@@ -1528,10 +1542,11 @@ fn preserves_machine_readable_stdout_and_streams_normal_stdout_and_stderr_progre
         None,
     );
     assert!(direct_stdout.contains("[download] Destination:"));
-    assert!(direct_stdout.contains("Downloaded direct URL"));
+    assert!(!direct_stdout.contains("Downloaded direct URL"));
     assert!(direct_stderr.contains("[download] 100% progress on stderr"));
+    assert!(direct_stderr.contains("Downloaded direct URL"));
 
-    // 4. Normal tracked upload streams yt-dlp stdout + stderr progress AND marks upload Downloaded.
+    // 4. Normal tracked upload streams yt-dlp stdout + stderr progress and routes Siphon summary to stderr.
     let (tracked_stdout, tracked_stderr, tracked_status) = invoke_harness_cli(
         &ws,
         &work_dir,
@@ -1543,12 +1558,13 @@ fn preserves_machine_readable_stdout_and_streams_normal_stdout_and_stderr_progre
         )),
     );
     assert!(tracked_stdout.contains("[download] Destination:"));
-    assert!(tracked_stdout.contains("marked as downloaded"));
+    assert!(!tracked_stdout.contains("marked as downloaded"));
     assert!(tracked_stderr.contains("[download] 100% progress on stderr"));
+    assert!(tracked_stderr.contains("marked as downloaded"));
     assert_eq!(tracked_status, Some(UploadStatus::Downloaded));
 
     // 5. Tracked upload with `--print after_move:filepath` marks Downloaded without Siphon stdout summary.
-    let (tracked_print_stdout, _, tracked_print_status) = invoke_harness_cli(
+    let (tracked_print_stdout, tracked_print_stderr, tracked_print_status) = invoke_harness_cli(
         &ws,
         &work_dir,
         &[
@@ -1572,5 +1588,85 @@ fn preserves_machine_readable_stdout_and_streams_normal_stdout_and_stderr_progre
             .ends_with("Stub Video [BV1trackedprint].mp4")
     );
     assert!(!tracked_print_stdout.contains("marked as downloaded"));
+    assert!(tracked_print_stderr.contains("marked as downloaded"));
     assert_eq!(tracked_print_status, Some(UploadStatus::Downloaded));
+}
+
+#[test]
+fn config_and_alias_json_passthrough_keeps_stdout_transparent() {
+    let ws = TempWorkspace::new("config-alias-json");
+    let work_dir = ws.path().join("work");
+    fs::create_dir_all(&work_dir).unwrap();
+
+    // 1. Ambient `yt-dlp.conf` enabling `-J` without any `-J` flag on the Siphon CLI.
+    fs::write(work_dir.join("yt-dlp.conf"), "-J\n").unwrap();
+    let (ambient_stdout, ambient_stderr, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1confjson",
+        ],
+        None,
+    );
+    let ambient_trimmed = ambient_stdout.trim();
+    assert!(
+        ambient_trimmed.starts_with('{') && ambient_trimmed.ends_with('}'),
+        "expected pure JSON stdout from ambient yt-dlp.conf, got: {ambient_stdout:?}"
+    );
+    assert!(ambient_trimmed.contains("\"id\":\"BV1confjson\""));
+    assert!(!ambient_stdout.contains("Finished direct URL"));
+    assert!(ambient_stderr.contains("Finished direct URL"));
+
+    // 2. Explicit `--config-locations` enabling `--dump-single-json`.
+    fs::remove_file(work_dir.join("yt-dlp.conf")).unwrap();
+    let custom_conf = ws.path().join("json.conf");
+    fs::write(&custom_conf, "--dump-single-json\n").unwrap();
+    let (ext_conf_stdout, ext_conf_stderr, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1extconfjson",
+            "--",
+            "--config-locations",
+            &custom_conf.to_string_lossy(),
+        ],
+        None,
+    );
+    let ext_trimmed = ext_conf_stdout.trim();
+    assert!(
+        ext_trimmed.starts_with('{') && ext_trimmed.ends_with('}'),
+        "expected pure JSON stdout from --config-locations, got: {ext_conf_stdout:?}"
+    );
+    assert!(ext_trimmed.contains("\"id\":\"BV1extconfjson\""));
+    assert!(!ext_conf_stdout.contains("Finished direct URL"));
+    assert!(ext_conf_stderr.contains("Finished direct URL"));
+
+    // 3. `--alias` macro expanding to `-J --quiet` without any standalone `-J` token on the CLI.
+    let (alias_stdout, alias_stderr, _) = invoke_harness_cli(
+        &ws,
+        &work_dir,
+        &[
+            "siphon",
+            "download",
+            "https://www.bilibili.com/video/BV1aliasjson",
+            "--",
+            "--alias",
+            "--jsonmacro",
+            "-J --quiet",
+            "--jsonmacro",
+        ],
+        None,
+    );
+    let alias_trimmed = alias_stdout.trim();
+    assert!(
+        alias_trimmed.starts_with('{') && alias_trimmed.ends_with('}'),
+        "expected pure JSON stdout from --alias, got: {alias_stdout:?}"
+    );
+    assert!(alias_trimmed.contains("\"id\":\"BV1aliasjson\""));
+    assert!(!alias_stdout.contains("Finished direct URL"));
+    assert!(alias_stderr.contains("Finished direct URL"));
 }

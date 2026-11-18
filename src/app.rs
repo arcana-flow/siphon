@@ -20,10 +20,32 @@ pub struct AppServices<'a> {
 }
 
 /// Formatted user-facing output produced by a completed command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandOutput {
     /// Text printed to standard output.
     pub stdout: String,
+    /// Text printed to standard error (for example, Siphon download summaries).
+    pub stderr: String,
+}
+
+impl CommandOutput {
+    /// Creates a [`CommandOutput`] carrying only standard output text.
+    #[must_use]
+    pub fn from_stdout(stdout: impl Into<String>) -> Self {
+        Self {
+            stdout: stdout.into(),
+            stderr: String::new(),
+        }
+    }
+
+    /// Creates a [`CommandOutput`] carrying only standard error text.
+    #[must_use]
+    pub fn from_stderr(stderr: impl Into<String>) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
 }
 
 /// Dispatches a parsed [`Cli`] command against the provided [`AppServices`].
@@ -49,22 +71,18 @@ fn execute_creator(
                 &url,
                 Timestamp::now(),
             )?;
-            Ok(CommandOutput {
-                stdout: format!(
-                    "Followed creator {} ({}) [{}] starting at {}\n",
-                    followed.creator.id,
-                    followed.creator.display_name,
-                    followed.creator.platform_creator_id,
-                    followed.follow.refresh_checkpoint
-                ),
-            })
+            Ok(CommandOutput::from_stdout(format!(
+                "Followed creator {} ({}) [{}] starting at {}\n",
+                followed.creator.id,
+                followed.creator.display_name,
+                followed.creator.platform_creator_id,
+                followed.follow.refresh_checkpoint
+            )))
         }
         CreatorCommand::List => {
             let creators = services.storage.list_followed_creators()?;
             if creators.is_empty() {
-                return Ok(CommandOutput {
-                    stdout: "No followed creators.\n".to_owned(),
-                });
+                return Ok(CommandOutput::from_stdout("No followed creators.\n"));
             }
             let mut out = String::new();
             for item in creators {
@@ -79,16 +97,14 @@ fn execute_creator(
                     item.follow.refresh_checkpoint,
                 );
             }
-            Ok(CommandOutput { stdout: out })
+            Ok(CommandOutput::from_stdout(out))
         }
         CreatorCommand::Remove { id } => {
             let creator = services.storage.unfollow_creator(id)?;
-            Ok(CommandOutput {
-                stdout: format!(
-                    "Unfollowed creator {} ({}); existing uploads preserved\n",
-                    creator.id, creator.display_name
-                ),
-            })
+            Ok(CommandOutput::from_stdout(format!(
+                "Unfollowed creator {} ({}); existing uploads preserved\n",
+                creator.id, creator.display_name
+            )))
         }
     }
 }
@@ -105,9 +121,7 @@ fn execute_refresh(
         policy,
     )?;
     summary.check_failures()?;
-    Ok(CommandOutput {
-        stdout: format_refresh_summary(&summary),
-    })
+    Ok(CommandOutput::from_stdout(format_refresh_summary(&summary)))
 }
 
 fn format_refresh_summary(summary: &RefreshSummary) -> String {
@@ -158,9 +172,7 @@ fn execute_upload(
         UploadCommand::List => {
             let uploads = storage.list_pending_uploads()?;
             if uploads.is_empty() {
-                return Ok(CommandOutput {
-                    stdout: "No pending uploads.\n".to_owned(),
-                });
+                return Ok(CommandOutput::from_stdout("No pending uploads.\n"));
             }
             let mut out = String::new();
             for upload in uploads {
@@ -170,13 +182,14 @@ fn execute_upload(
                     upload.id, upload.creator_id, upload.published_at, upload.title, upload.url
                 );
             }
-            Ok(CommandOutput { stdout: out })
+            Ok(CommandOutput::from_stdout(out))
         }
         UploadCommand::Ignore { id } => {
             let upload = storage.mark_upload_ignored(id)?;
-            Ok(CommandOutput {
-                stdout: format!("Ignored upload {} ({})\n", upload.id, upload.title),
-            })
+            Ok(CommandOutput::from_stdout(format!(
+                "Ignored upload {} ({})\n",
+                upload.id, upload.title
+            )))
         }
     }
 }
@@ -203,12 +216,6 @@ fn execute_download_command(
             exit_code: Some(1),
             stderr: message,
         }));
-    }
-
-    if report.request.preserves_passthrough_stdout() {
-        return Ok(CommandOutput {
-            stdout: String::new(),
-        });
     }
 
     let status_note = match &report.request.target {
@@ -238,9 +245,9 @@ fn execute_download_command(
             }
         }
     };
-    Ok(CommandOutput {
-        stdout: format!("{status_note}\n"),
-    })
+    // Route Siphon download summaries to stderr so yt-dlp's stdout stays uncontaminated
+    // regardless of whether stdout modes (-J, --print, etc.) come from argv, config, or aliases.
+    Ok(CommandOutput::from_stderr(format!("{status_note}\n")))
 }
 
 fn execute_preset(
@@ -251,13 +258,11 @@ fn execute_preset(
         PresetCommand::Add { name, args } => {
             name.ensure_custom()?;
             let preset = storage.add_preset(name, args)?;
-            Ok(CommandOutput {
-                stdout: format!(
-                    "Saved preset '{}' with {} argument(s)\n",
-                    preset.name,
-                    preset.args.len()
-                ),
-            })
+            Ok(CommandOutput::from_stdout(format!(
+                "Saved preset '{}' with {} argument(s)\n",
+                preset.name,
+                preset.args.len()
+            )))
         }
         PresetCommand::List => {
             let presets = storage.list_presets()?;
@@ -276,7 +281,7 @@ fn execute_preset(
                     entry.preset.args.join(" ")
                 );
             }
-            Ok(CommandOutput { stdout: out })
+            Ok(CommandOutput::from_stdout(out))
         }
         PresetCommand::Remove { name } => {
             name.ensure_custom()?;
@@ -286,13 +291,14 @@ fn execute_preset(
                 msg.push_str("; default preset reset to 'video'");
             }
             msg.push('\n');
-            Ok(CommandOutput { stdout: msg })
+            Ok(CommandOutput::from_stdout(msg))
         }
         PresetCommand::SetDefault { name } => {
             let preset = storage.set_default_preset(&name)?;
-            Ok(CommandOutput {
-                stdout: format!("Default preset set to '{}'\n", preset.name),
-            })
+            Ok(CommandOutput::from_stdout(format!(
+                "Default preset set to '{}'\n",
+                preset.name
+            )))
         }
     }
 }

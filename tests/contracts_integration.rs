@@ -535,9 +535,16 @@ impl Downloader for StubDownloader {
     }
 }
 
-fn run_cmd(services: &AppServices<'_>, argv: &[&str]) -> Result<String, AppError> {
+fn run_cmd_output(
+    services: &AppServices<'_>,
+    argv: &[&str],
+) -> Result<siphon::app::CommandOutput, AppError> {
     let cli = Cli::try_parse_from(argv).expect("test argv must parse");
-    execute(cli, services).map(|out| out.stdout)
+    execute(cli, services)
+}
+
+fn run_cmd(services: &AppServices<'_>, argv: &[&str]) -> Result<String, AppError> {
+    run_cmd_output(services, argv).map(|out| out.stdout)
 }
 
 #[test]
@@ -903,7 +910,7 @@ fn download_status_updates_only_on_confirmed_upload_artifact() {
     let upload_url = storage.list_pending_uploads().unwrap()[0].url.clone();
 
     // Simulation leaves upload pending.
-    let sim_out = run_cmd(
+    let sim_out = run_cmd_output(
         &sim_services,
         &[
             "siphon",
@@ -915,7 +922,8 @@ fn download_status_updates_only_on_confirmed_upload_artifact() {
         ],
     )
     .unwrap();
-    assert!(sim_out.contains("remains pending"));
+    assert!(sim_out.stdout.is_empty());
+    assert!(sim_out.stderr.contains("remains pending"));
     assert_eq!(
         storage.get_upload(upload_id).unwrap().status,
         UploadStatus::Pending
@@ -928,22 +936,33 @@ fn download_status_updates_only_on_confirmed_upload_artifact() {
         refresh_source: &refresh,
         downloader: &ok_downloader,
     };
-    let direct_ok = run_cmd(&ok_services, &["siphon", "download", &upload_url]).unwrap();
-    assert!(direct_ok.contains("Downloaded direct URL"));
-    assert!(direct_ok.contains("1 artifact(s) confirmed"));
+    let direct_ok = run_cmd_output(&ok_services, &["siphon", "download", &upload_url]).unwrap();
+    assert!(direct_ok.stdout.is_empty());
+    assert!(direct_ok.stderr.contains("Downloaded direct URL"));
+    assert!(direct_ok.stderr.contains("1 artifact(s) confirmed"));
     assert_eq!(
         storage.get_upload(upload_id).unwrap().status,
         UploadStatus::Pending
     );
 
     // Direct URL simulation / run without confirmed artifacts uses neutral completion message.
-    let direct_sim = run_cmd(
+    let direct_sim = run_cmd_output(
         &sim_services,
         &["siphon", "download", &upload_url, "--", "--simulate"],
     )
     .unwrap();
-    assert!(!direct_sim.to_ascii_lowercase().contains("downloaded"));
-    assert!(direct_sim.contains("without confirmed output artifact"));
+    assert!(direct_sim.stdout.is_empty());
+    assert!(
+        !direct_sim
+            .stderr
+            .to_ascii_lowercase()
+            .contains("downloaded")
+    );
+    assert!(
+        direct_sim
+            .stderr
+            .contains("without confirmed output artifact")
+    );
     assert_eq!(
         storage.get_upload(upload_id).unwrap().status,
         UploadStatus::Pending
@@ -1011,12 +1030,13 @@ fn download_status_updates_only_on_confirmed_upload_artifact() {
     );
 
     // Confirmed upload download marks it Downloaded and passes `--no-playlist`.
-    let ok_out = run_cmd(
+    let ok_out = run_cmd_output(
         &ok_services,
         &["siphon", "download", "--upload", &upload_id.to_string()],
     )
     .unwrap();
-    assert!(ok_out.contains("marked as downloaded"));
+    assert!(ok_out.stdout.is_empty());
+    assert!(ok_out.stderr.contains("marked as downloaded"));
     assert_eq!(
         storage.get_upload(upload_id).unwrap().status,
         UploadStatus::Downloaded

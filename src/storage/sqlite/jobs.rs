@@ -916,6 +916,77 @@ enum StoredCreatorOutcome {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredArtifactPath {
+    Utf8(String),
+    Native {
+        display: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unix_bytes: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        windows_wide: Option<Vec<u16>>,
+    },
+}
+
+fn encode_artifact_path(path: &std::path::Path) -> StoredArtifactPath {
+    if let Some(utf8) = path.to_str() {
+        return StoredArtifactPath::Utf8(utf8.to_owned());
+    }
+
+    let display = path.to_string_lossy().into_owned();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        StoredArtifactPath::Native {
+            display,
+            unix_bytes: Some(path.as_os_str().as_bytes().to_vec()),
+            windows_wide: None,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        StoredArtifactPath::Native {
+            display,
+            unix_bytes: None,
+            windows_wide: Some(path.as_os_str().encode_wide().collect()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        StoredArtifactPath::Native {
+            display,
+            unix_bytes: None,
+            windows_wide: None,
+        }
+    }
+}
+
+fn decode_artifact_path(stored: StoredArtifactPath) -> PathBuf {
+    match stored {
+        StoredArtifactPath::Utf8(utf8) => PathBuf::from(utf8),
+        StoredArtifactPath::Native {
+            display,
+            unix_bytes,
+            windows_wide,
+        } => {
+            let _ = (&unix_bytes, &windows_wide);
+            #[cfg(unix)]
+            if let Some(bytes) = unix_bytes {
+                use std::os::unix::ffi::OsStringExt;
+                return PathBuf::from(std::ffi::OsString::from_vec(bytes));
+            }
+            #[cfg(windows)]
+            if let Some(wide) = windows_wide {
+                use std::os::windows::ffi::OsStringExt;
+                return PathBuf::from(std::ffi::OsString::from_wide(&wide));
+            }
+            PathBuf::from(display)
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredJobOutcome {
     Refresh {
@@ -923,7 +994,7 @@ enum StoredJobOutcome {
         error: Option<String>,
     },
     Download {
-        confirmed_artifacts: Vec<String>,
+        confirmed_artifacts: Vec<StoredArtifactPath>,
         marked_downloaded: bool,
         error: Option<String>,
     },
@@ -1041,22 +1112,15 @@ fn encode_outcome(outcome: &JobOutcome) -> Result<String, StorageError> {
                 .collect(),
             error: refresh.error.clone(),
         },
-        JobOutcome::Download(download) => {
-            let mut confirmed_artifacts = Vec::with_capacity(download.confirmed_artifacts.len());
-            for path in &download.confirmed_artifacts {
-                let path_str = path.to_str().ok_or_else(|| {
-                    StorageError::Backend(
-                        "confirmed artifact path must be valid UTF-8 for SQLite storage".to_owned(),
-                    )
-                })?;
-                confirmed_artifacts.push(path_str.to_owned());
-            }
-            StoredJobOutcome::Download {
-                confirmed_artifacts,
-                marked_downloaded: download.marked_downloaded,
-                error: download.error.clone(),
-            }
-        }
+        JobOutcome::Download(download) => StoredJobOutcome::Download {
+            confirmed_artifacts: download
+                .confirmed_artifacts
+                .iter()
+                .map(|path| encode_artifact_path(path))
+                .collect(),
+            marked_downloaded: download.marked_downloaded,
+            error: download.error.clone(),
+        },
         JobOutcome::Interrupted(interrupted) => StoredJobOutcome::Interrupted {
             reason: interrupted.reason.clone(),
         },
@@ -1131,7 +1195,10 @@ fn decode_outcome(
             marked_downloaded,
             error,
         } => JobOutcome::Download(DownloadJobOutcome {
-            confirmed_artifacts: confirmed_artifacts.into_iter().map(PathBuf::from).collect(),
+            confirmed_artifacts: confirmed_artifacts
+                .into_iter()
+                .map(decode_artifact_path)
+                .collect(),
             marked_downloaded,
             error,
         }),

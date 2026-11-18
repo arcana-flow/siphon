@@ -753,9 +753,9 @@ pub(crate) fn validate_outcome_for_state_and_kind(
             if download.error.is_some() {
                 return Err("succeeded upload download cannot carry an error message".to_owned());
             }
-            if !download.marked_downloaded || download.confirmed_artifacts.is_empty() {
+            if download.marked_downloaded && download.confirmed_artifacts.is_empty() {
                 return Err(
-                    "succeeded upload download requires confirmed artifacts and marked_downloaded = true"
+                    "upload download marked as downloaded requires at least one confirmed artifact"
                         .to_owned(),
                 );
             }
@@ -1119,6 +1119,21 @@ mod tests {
             }
             .validate_for_kind(JobKind::UploadDownload)
             .is_err()
+        );
+
+        let simulated_upload = JobOutcome::Download(DownloadJobOutcome {
+            confirmed_artifacts: Vec::new(),
+            marked_downloaded: false,
+            error: None,
+        });
+        assert!(
+            JobCompletion::Succeeded {
+                progress: None,
+                outcome: simulated_upload,
+                finished_at: now,
+            }
+            .validate_for_kind(JobKind::UploadDownload)
+            .is_ok()
         );
 
         let direct_marked_upload = JobOutcome::Download(DownloadJobOutcome {

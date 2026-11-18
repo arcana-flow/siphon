@@ -792,3 +792,159 @@ fn independent_connections_contend_atomically_on_exclusive_slots() {
     assert_eq!(fg_winners.len(), 1);
     assert_eq!(fg_conflicts, workers - 1);
 }
+
+#[test]
+fn upload_download_simulation_succeeds_without_artifacts_and_releases_slot() {
+    let temp = TempDir::new("upload-sim-success");
+    let db_path = temp.path().join("sim.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+
+    let upload_id = UploadId::new(91).unwrap();
+    let t0 = Timestamp::from_unix_seconds(1_760_000_000);
+    let t1 = Timestamp::from_unix_seconds(1_760_000_010);
+
+    let started = storage
+        .start_background_job(StartJobRequest {
+            target: JobTarget::UploadDownload {
+                upload_id,
+                url: None,
+            },
+            owner: owner(901, Some("sim-1")),
+            started_at: t0,
+            initial_progress: None,
+        })
+        .unwrap();
+
+    // Claiming marked_downloaded = true without any artifact must still be rejected.
+    assert!(
+        storage
+            .finish_job(
+                &started.lease,
+                JobCompletion::Succeeded {
+                    progress: None,
+                    outcome: JobOutcome::Download(DownloadJobOutcome {
+                        confirmed_artifacts: Vec::new(),
+                        marked_downloaded: true,
+                        error: None,
+                    }),
+                    finished_at: t1,
+                },
+            )
+            .is_err()
+    );
+
+    // Simulation or unattributed run succeeds with empty artifacts and marked_downloaded = false.
+    let finished = storage
+        .finish_job(
+            &started.lease,
+            JobCompletion::Succeeded {
+                progress: None,
+                outcome: JobOutcome::Download(DownloadJobOutcome {
+                    confirmed_artifacts: Vec::new(),
+                    marked_downloaded: false,
+                    error: None,
+                }),
+                finished_at: t1,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(finished.state, JobState::Succeeded);
+    assert_eq!(
+        storage
+            .get_active_reservation(OperationSlot::UploadDownload(upload_id))
+            .unwrap(),
+        None
+    );
+
+    drop(storage);
+    let reopened = SqliteStorage::open(&db_path).unwrap();
+    assert_eq!(reopened.get_job(started.job.id).unwrap(), finished);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn non_utf8_confirmed_artifact_path_completes_persists_and_releases_slot() {
+    let temp = TempDir::new("non-utf8-artifact");
+    let db_path = temp.path().join("non_utf8.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+
+    let upload_id = UploadId::new(92).unwrap();
+    let t0 = Timestamp::from_unix_seconds(1_760_000_000);
+    let t1 = Timestamp::from_unix_seconds(1_760_000_015);
+
+    #[cfg(unix)]
+    let native_path = {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(
+            b"/tmp/siphon_non_utf8_\xff_\xfe/video.mp4".to_vec(),
+        ))
+    };
+    #[cfg(windows)]
+    let native_path = {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xD800,
+            b'_' as u16,
+            b'v' as u16,
+            b'i' as u16,
+            b'd' as u16,
+            b'.' as u16,
+            b'm' as u16,
+            b'p' as u16,
+            b'4' as u16,
+        ]))
+    };
+    assert!(native_path.to_str().is_none());
+
+    let started = storage
+        .start_background_job(StartJobRequest {
+            target: JobTarget::UploadDownload {
+                upload_id,
+                url: None,
+            },
+            owner: owner(902, Some("non-utf8-1")),
+            started_at: t0,
+            initial_progress: None,
+        })
+        .unwrap();
+
+    let finished = storage
+        .finish_job(
+            &started.lease,
+            JobCompletion::Succeeded {
+                progress: None,
+                outcome: JobOutcome::Download(DownloadJobOutcome {
+                    confirmed_artifacts: vec![native_path.clone()],
+                    marked_downloaded: true,
+                    error: None,
+                }),
+                finished_at: t1,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(finished.state, JobState::Succeeded);
+    assert_eq!(
+        storage
+            .get_active_reservation(OperationSlot::UploadDownload(upload_id))
+            .unwrap(),
+        None
+    );
+
+    drop(storage);
+    let reopened = SqliteStorage::open(&db_path).unwrap();
+    let queried = reopened.get_job(started.job.id).unwrap();
+    assert_eq!(queried, finished);
+    match queried.outcome {
+        Some(JobOutcome::Download(download)) => {
+            assert_eq!(download.confirmed_artifacts, vec![native_path]);
+        }
+        other => panic!("expected download outcome, got {other:?}"),
+    }
+}

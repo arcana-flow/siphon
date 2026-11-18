@@ -77,6 +77,25 @@ pub enum ValidationError {
     },
 }
 
+impl ValidationError {
+    /// Returns the stable machine-readable error code for this validation failure.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::InvalidCreatorId { .. } => "invalid_creator_id",
+            Self::InvalidUploadId { .. } => "invalid_upload_id",
+            Self::InvalidFollowId { .. } => "invalid_follow_id",
+            Self::InvalidPresetName { .. } => "invalid_preset_name",
+            Self::ReservedPresetName { .. } => "reserved_preset_name",
+            Self::EmptyValue { .. } => "empty_value",
+            Self::InvalidCookiePath { .. } => "invalid_cookie_path",
+            Self::EmptyDatabasePath => "empty_database_path",
+            Self::UnsupportedPlatform { .. } => "unsupported_platform",
+            Self::InvalidUploadStatus { .. } => "invalid_upload_status",
+        }
+    }
+}
+
 /// Errors produced by the local persistence layer.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StorageError {
@@ -162,6 +181,27 @@ pub enum StorageError {
     Backend(String),
 }
 
+impl StorageError {
+    /// Returns the stable machine-readable error code for this storage failure.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::NotImplemented => "storage_not_implemented",
+            Self::CreatorNotFound { .. } => "creator_not_found",
+            Self::CreatorAlreadyFollowed { .. } => "creator_already_followed",
+            Self::CreatorNotFollowed { .. } => "creator_not_followed",
+            Self::UploadNotFound { .. } => "upload_not_found",
+            Self::UploadNotPending { .. } => "upload_not_pending",
+            Self::PresetNotFound { .. } => "preset_not_found",
+            Self::PresetAlreadyExists { .. } => "preset_already_exists",
+            Self::CannotModifyBuiltinPreset { .. } => "cannot_modify_builtin_preset",
+            Self::StaleRefreshCheckpoint { .. } => "stale_refresh_checkpoint",
+            Self::CorruptedData(_) => "corrupted_storage_data",
+            Self::Backend(_) => "storage_backend_error",
+        }
+    }
+}
+
 /// Errors produced when resolving creators or fetching uploads from a platform.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RefreshError {
@@ -207,6 +247,22 @@ pub enum RefreshError {
     Storage(#[from] StorageError),
 }
 
+impl RefreshError {
+    /// Returns the stable machine-readable error code for this refresh failure.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::NotImplemented => "refresh_not_implemented",
+            Self::InvalidCreatorUrl { .. } => "invalid_creator_url",
+            Self::CreatorNotFoundRemote { .. } => "creator_not_found_remote",
+            Self::CookieSourceInvalid { .. } => "cookie_source_invalid",
+            Self::Network(_) => "refresh_network_error",
+            Self::PlatformResponse(_) => "refresh_platform_error",
+            Self::Storage(err) => err.error_code(),
+        }
+    }
+}
+
 /// Errors produced when invoking `yt-dlp` or verifying download artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DownloadError {
@@ -250,6 +306,13 @@ pub enum DownloadError {
         reason: String,
     },
 
+    /// Effective downloader options would stream media to stdout while stdout is reserved.
+    #[error("streaming media to stdout ('{source_detail}') is not allowed when --json is enabled")]
+    MediaToStdoutDisallowed {
+        /// Where the stdout output template originated (CLI, preset, or config).
+        source_detail: String,
+    },
+
     /// Unexpected I/O error while preparing or inspecting download artifacts.
     #[error("download I/O error: {0}")]
     Io(String),
@@ -257,6 +320,23 @@ pub enum DownloadError {
     /// Storage error encountered during download orchestration.
     #[error(transparent)]
     Storage(#[from] StorageError),
+}
+
+impl DownloadError {
+    /// Returns the stable machine-readable error code for this download failure.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::NotImplemented => "download_not_implemented",
+            Self::DownloaderUnavailable { .. } => "downloader_unavailable",
+            Self::ProcessFailed { .. } => "download_process_failed",
+            Self::CookieSourceInvalid { .. } => "cookie_source_invalid",
+            Self::InvalidArguments { .. } => "invalid_download_arguments",
+            Self::MediaToStdoutDisallowed { .. } => "media_to_stdout_not_allowed",
+            Self::Io(_) => "download_io_error",
+            Self::Storage(err) => err.error_code(),
+        }
+    }
 }
 
 fn format_process_failure(exit_code: Option<i32>, stderr: &str) -> String {
@@ -307,6 +387,20 @@ pub enum AppError {
         /// Per-creator failure details.
         failures: Vec<CreatorRefreshFailure>,
     },
+}
+
+impl AppError {
+    /// Returns the stable machine-readable error code for this application failure.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::Validation(err) => err.error_code(),
+            Self::Storage(err) => err.error_code(),
+            Self::Refresh(err) => err.error_code(),
+            Self::Download(err) => err.error_code(),
+            Self::RefreshPartialFailure { .. } => "refresh_partial_failure",
+        }
+    }
 }
 
 fn format_partial_refresh(succeeded: usize, failures: &[CreatorRefreshFailure]) -> String {

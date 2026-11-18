@@ -1,13 +1,14 @@
 //! Command dispatch wiring connecting the CLI to storage, refresh, and download services.
 
-use std::fmt::Write as _;
-
 use crate::cli::{Cli, Command, CreatorCommand, PresetCommand, UploadCommand};
 use crate::domain::Timestamp;
-use crate::download::execute_download;
+use crate::download::{DownloadExecutionOptions, execute_download_with_options};
 use crate::error::{AppError, DownloadError};
-use crate::refresh::{CreatorRefreshOutcome, RefreshSummary, follow_creator, refresh_creators};
+use crate::output::{CommandResult, HumanRenderOptions};
+use crate::refresh::{follow_creator, refresh_creators};
 use crate::storage::Storage;
+
+pub use crate::output::CommandOutput;
 
 /// Borrowed service dependencies supplied to execute a parsed Siphon CLI command.
 pub struct AppServices<'a> {
@@ -19,50 +20,98 @@ pub struct AppServices<'a> {
     pub downloader: &'a dyn crate::download::Downloader,
 }
 
-/// Formatted user-facing output produced by a completed command.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CommandOutput {
-    /// Text printed to standard output.
-    pub stdout: String,
-    /// Text printed to standard error (for example, Siphon download summaries).
-    pub stderr: String,
+/// Execution options controlling downloader stream behavior and output assumptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppExecuteOptions {
+    /// Stream-routing and media-to-stdout options passed to [`execute_download_with_options`].
+    pub download: DownloadExecutionOptions,
 }
 
-impl CommandOutput {
-    /// Creates a [`CommandOutput`] carrying only standard output text.
-    #[must_use]
-    pub fn from_stdout(stdout: impl Into<String>) -> Self {
+/// Typed result of executing a CLI command, preserving partial-failure context such as full
+/// per-creator refresh outcomes alongside any nonzero [`AppError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandExecution {
+    /// Structured command outcome, present on success and on partial refresh failure.
+    pub result: Option<CommandResult>,
+    /// Failure to report (and exit nonzero for), if any.
+    pub error: Option<AppError>,
+}
+
+impl CommandExecution {
+    fn ok(result: CommandResult) -> Self {
         Self {
-            stdout: stdout.into(),
-            stderr: String::new(),
+            result: Some(result),
+            error: None,
         }
     }
 
-    /// Creates a [`CommandOutput`] carrying only standard error text.
-    #[must_use]
-    pub fn from_stderr(stderr: impl Into<String>) -> Self {
+    fn err(error: AppError) -> Self {
         Self {
-            stdout: String::new(),
-            stderr: stderr.into(),
+            result: None,
+            error: Some(error),
+        }
+    }
+
+    fn partial(result: CommandResult, error: AppError) -> Self {
+        Self {
+            result: Some(result),
+            error: Some(error),
         }
     }
 }
 
-/// Dispatches a parsed [`Cli`] command against the provided [`AppServices`].
+/// Dispatches a parsed [`Cli`] command against the provided [`AppServices`] and renders plain
+/// human-readable output (TSV/plain text on stdout/stderr).
 pub fn execute(cli: Cli, services: &AppServices<'_>) -> Result<CommandOutput, AppError> {
+    let result = execute_typed(cli, services)?;
+    Ok(result.render_human(HumanRenderOptions::plain()))
+}
+
+/// Dispatches a parsed [`Cli`] command and returns its typed [`CommandResult`] or [`AppError`].
+pub fn execute_typed(cli: Cli, services: &AppServices<'_>) -> Result<CommandResult, AppError> {
+    let execution = execute_with_options(cli, services, AppExecuteOptions::default());
+    match execution.error {
+        Some(err) => Err(err),
+        None => Ok(execution
+            .result
+            .expect("successful execution always produces a CommandResult")),
+    }
+}
+
+/// Dispatches a parsed [`Cli`] command with explicit [`AppExecuteOptions`], preserving partial
+/// results (such as all per-creator refresh outcomes) even when returning a nonzero error.
+pub fn execute_with_options(
+    cli: Cli,
+    services: &AppServices<'_>,
+    options: AppExecuteOptions,
+) -> CommandExecution {
     match cli.command {
-        Command::Creator(args) => execute_creator(args.command, services),
+        Command::Creator(args) => match execute_creator(args.command, services) {
+            Ok(res) => CommandExecution::ok(res),
+            Err(err) => CommandExecution::err(err),
+        },
         Command::Refresh(args) => execute_refresh(args, services),
-        Command::Upload(args) => execute_upload(args.command, services.storage),
-        Command::Download(args) => execute_download_command(args, services),
-        Command::Preset(args) => execute_preset(args.command, services.storage),
+        Command::Upload(args) => match execute_upload(args.command, services.storage) {
+            Ok(res) => CommandExecution::ok(res),
+            Err(err) => CommandExecution::err(err),
+        },
+        Command::Download(args) => {
+            match execute_download_command(args, services, options.download) {
+                Ok(res) => CommandExecution::ok(res),
+                Err(err) => CommandExecution::err(err),
+            }
+        }
+        Command::Preset(args) => match execute_preset(args.command, services.storage) {
+            Ok(res) => CommandExecution::ok(res),
+            Err(err) => CommandExecution::err(err),
+        },
     }
 }
 
 fn execute_creator(
     command: CreatorCommand,
     services: &AppServices<'_>,
-) -> Result<CommandOutput, AppError> {
+) -> Result<CommandResult, AppError> {
     match command {
         CreatorCommand::Add { url } => {
             let followed = follow_creator(
@@ -71,125 +120,51 @@ fn execute_creator(
                 &url,
                 Timestamp::now(),
             )?;
-            Ok(CommandOutput::from_stdout(format!(
-                "Followed creator {} ({}) [{}] starting at {}\n",
-                followed.creator.id,
-                followed.creator.display_name,
-                followed.creator.platform_creator_id,
-                followed.follow.refresh_checkpoint
-            )))
+            Ok(CommandResult::CreatorAdded(followed))
         }
         CreatorCommand::List => {
             let creators = services.storage.list_followed_creators()?;
-            if creators.is_empty() {
-                return Ok(CommandOutput::from_stdout("No followed creators.\n"));
-            }
-            let mut out = String::new();
-            for item in creators {
-                let _ = writeln!(
-                    out,
-                    "{}\t{}\t{}\t{}\tfollowed={}\tcheckpoint={}",
-                    item.creator.id,
-                    item.creator.platform,
-                    item.creator.platform_creator_id,
-                    item.creator.display_name,
-                    item.follow.followed_at,
-                    item.follow.refresh_checkpoint,
-                );
-            }
-            Ok(CommandOutput::from_stdout(out))
+            Ok(CommandResult::CreatorsListed(creators))
         }
         CreatorCommand::Remove { id } => {
             let creator = services.storage.unfollow_creator(id)?;
-            Ok(CommandOutput::from_stdout(format!(
-                "Unfollowed creator {} ({}); existing uploads preserved\n",
-                creator.id, creator.display_name
-            )))
+            Ok(CommandResult::CreatorRemoved(creator))
         }
     }
 }
 
-fn execute_refresh(
-    args: crate::cli::RefreshArgs,
-    services: &AppServices<'_>,
-) -> Result<CommandOutput, AppError> {
-    let policy = args.cookie_policy()?;
-    let summary = refresh_creators(
+fn execute_refresh(args: crate::cli::RefreshArgs, services: &AppServices<'_>) -> CommandExecution {
+    let policy = match args.cookie_policy() {
+        Ok(policy) => policy,
+        Err(err) => return CommandExecution::err(err.into()),
+    };
+    let summary = match refresh_creators(
         services.storage,
         services.refresh_source,
         args.creator_id,
         policy,
-    )?;
-    summary.check_failures()?;
-    Ok(CommandOutput::from_stdout(format_refresh_summary(&summary)))
-}
-
-fn format_refresh_summary(summary: &RefreshSummary) -> String {
-    let mut out = String::new();
-    if summary.cleared_default_cookies {
-        out.push_str("Cleared remembered default refresh cookie source.\n");
+    ) {
+        Ok(summary) => summary,
+        Err(err) => return CommandExecution::err(err),
+    };
+    match summary.check_failures() {
+        Ok(()) => CommandExecution::ok(CommandResult::Refreshed(summary)),
+        Err(err) => CommandExecution::partial(CommandResult::Refreshed(summary), err),
     }
-    if summary.saved_default_cookies
-        && let Some(cookies) = &summary.used_cookies
-    {
-        let _ = writeln!(out, "Saved default refresh cookie source: {cookies}.");
-    }
-    if summary.outcomes.is_empty() {
-        out.push_str("No followed creators to refresh.\n");
-        return out;
-    }
-    for outcome in &summary.outcomes {
-        match outcome {
-            CreatorRefreshOutcome::Succeeded(committed) => {
-                let _ = writeln!(
-                    out,
-                    "Refreshed creator {} ({}): {} new upload(s), {} known, checkpoint {} -> {}",
-                    committed.creator_id,
-                    committed.display_name,
-                    committed.new_uploads_inserted,
-                    committed.existing_uploads_seen,
-                    committed.previous_checkpoint,
-                    committed.new_checkpoint,
-                );
-            }
-            CreatorRefreshOutcome::Failed { creator, error } => {
-                let _ = writeln!(
-                    out,
-                    "Failed creator {} ({}): {}",
-                    creator.creator.id, creator.creator.display_name, error
-                );
-            }
-        }
-    }
-    out
 }
 
 fn execute_upload(
     command: UploadCommand,
     storage: &dyn Storage,
-) -> Result<CommandOutput, AppError> {
+) -> Result<CommandResult, AppError> {
     match command {
         UploadCommand::List => {
             let uploads = storage.list_pending_uploads()?;
-            if uploads.is_empty() {
-                return Ok(CommandOutput::from_stdout("No pending uploads.\n"));
-            }
-            let mut out = String::new();
-            for upload in uploads {
-                let _ = writeln!(
-                    out,
-                    "{}\tcreator={}\t{}\t{}\t{}",
-                    upload.id, upload.creator_id, upload.published_at, upload.title, upload.url
-                );
-            }
-            Ok(CommandOutput::from_stdout(out))
+            Ok(CommandResult::UploadsListed(uploads))
         }
         UploadCommand::Ignore { id } => {
             let upload = storage.mark_upload_ignored(id)?;
-            Ok(CommandOutput::from_stdout(format!(
-                "Ignored upload {} ({})\n",
-                upload.id, upload.title
-            )))
+            Ok(CommandResult::UploadIgnored(upload))
         }
     }
 }
@@ -197,9 +172,15 @@ fn execute_upload(
 fn execute_download_command(
     args: crate::cli::DownloadArgs,
     services: &AppServices<'_>,
-) -> Result<CommandOutput, AppError> {
+    download_options: DownloadExecutionOptions,
+) -> Result<CommandResult, AppError> {
     let plan = args.to_plan_input()?;
-    let report = execute_download(services.storage, services.downloader, plan)?;
+    let report = execute_download_with_options(
+        services.storage,
+        services.downloader,
+        plan,
+        download_options,
+    )?;
     if !report.outcome.succeeded {
         let message = match &report.request.target {
             crate::download::DownloadTarget::DirectUrl { url } => {
@@ -218,87 +199,31 @@ fn execute_download_command(
         }));
     }
 
-    let status_note = match &report.request.target {
-        crate::download::DownloadTarget::DirectUrl { url } => {
-            if report.outcome.confirmed_artifacts.is_empty() {
-                format!("Finished direct URL {url} without confirmed output artifact")
-            } else {
-                format!(
-                    "Downloaded direct URL {url} ({} artifact(s) confirmed)",
-                    report.outcome.confirmed_artifacts.len()
-                )
-            }
-        }
-        crate::download::DownloadTarget::PendingUpload { upload } => {
-            if report.marked_downloaded {
-                format!(
-                    "Downloaded upload {} ({}) and marked as downloaded ({} artifact(s) confirmed)",
-                    upload.id,
-                    upload.title,
-                    report.outcome.confirmed_artifacts.len()
-                )
-            } else {
-                format!(
-                    "Finished upload {} ({}) without confirmed output artifact; status remains pending",
-                    upload.id, upload.title
-                )
-            }
-        }
-    };
-    // Route Siphon download summaries to stderr so yt-dlp's stdout stays uncontaminated
-    // regardless of whether stdout modes (-J, --print, etc.) come from argv, config, or aliases.
-    Ok(CommandOutput::from_stderr(format!("{status_note}\n")))
+    Ok(CommandResult::Downloaded(report))
 }
 
 fn execute_preset(
     command: PresetCommand,
     storage: &dyn Storage,
-) -> Result<CommandOutput, AppError> {
+) -> Result<CommandResult, AppError> {
     match command {
         PresetCommand::Add { name, args } => {
             name.ensure_custom()?;
             let preset = storage.add_preset(name, args)?;
-            Ok(CommandOutput::from_stdout(format!(
-                "Saved preset '{}' with {} argument(s)\n",
-                preset.name,
-                preset.args.len()
-            )))
+            Ok(CommandResult::PresetAdded(preset))
         }
         PresetCommand::List => {
             let presets = storage.list_presets()?;
-            let mut out = String::new();
-            for entry in presets {
-                let marker = if entry.is_default { "*" } else { " " };
-                let kind = if entry.preset.is_builtin {
-                    "built-in"
-                } else {
-                    "custom"
-                };
-                let _ = writeln!(
-                    out,
-                    "{marker} {}\t[{kind}]\t{}",
-                    entry.preset.name,
-                    entry.preset.args.join(" ")
-                );
-            }
-            Ok(CommandOutput::from_stdout(out))
+            Ok(CommandResult::PresetsListed(presets))
         }
         PresetCommand::Remove { name } => {
             name.ensure_custom()?;
             let outcome = storage.remove_preset(&name)?;
-            let mut msg = format!("Removed preset '{}'", outcome.removed);
-            if outcome.reset_default_to_builtin {
-                msg.push_str("; default preset reset to 'video'");
-            }
-            msg.push('\n');
-            Ok(CommandOutput::from_stdout(msg))
+            Ok(CommandResult::PresetRemoved(outcome))
         }
         PresetCommand::SetDefault { name } => {
             let preset = storage.set_default_preset(&name)?;
-            Ok(CommandOutput::from_stdout(format!(
-                "Default preset set to '{}'\n",
-                preset.name
-            )))
+            Ok(CommandResult::PresetDefaultSet(preset))
         }
     }
 }

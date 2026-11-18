@@ -1,6 +1,7 @@
 //! Media download integration contract, preset resolution, `yt-dlp` execution, and artifact rules.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
@@ -237,10 +238,78 @@ impl DownloadOutcome {
     }
 }
 
+/// Controls how a [`Downloader`] routes child `yt-dlp` standard I/O streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DownloadStreamMode {
+    /// Ordinary CLI mode: `yt-dlp` stdout passes through to Siphon stdout and stderr passes through to Siphon stderr.
+    #[default]
+    Passthrough,
+    /// Reserve Siphon stdout (e.g. `--json` mode): `yt-dlp` stdout is routed to Siphon stderr.
+    RedirectStdoutToStderr,
+    /// Background/silent mode: suppress forwarding `yt-dlp` stdout/stderr while still capturing attribution and error details.
+    CaptureSilent,
+}
+
+/// Execution and stream-routing options for a [`Downloader`] invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DownloadExecutionOptions {
+    /// How child process standard I/O streams are handled.
+    pub stream_mode: DownloadStreamMode,
+    /// When `true`, reject effective `yt-dlp` options that stream media to stdout (`-o -`).
+    pub refuse_media_to_stdout: bool,
+}
+
+impl DownloadExecutionOptions {
+    /// Ordinary interactive/CLI passthrough mode.
+    #[must_use]
+    pub const fn passthrough() -> Self {
+        Self {
+            stream_mode: DownloadStreamMode::Passthrough,
+            refuse_media_to_stdout: false,
+        }
+    }
+
+    /// `--json` CLI mode: reserves stdout, redirects text `yt-dlp` output to stderr, and refuses media-to-stdout.
+    #[must_use]
+    pub const fn json_mode() -> Self {
+        Self {
+            stream_mode: DownloadStreamMode::RedirectStdoutToStderr,
+            refuse_media_to_stdout: true,
+        }
+    }
+
+    /// Background job capture mode: suppresses process stdio forwarding while capturing attribution and error output.
+    #[must_use]
+    pub const fn background_capture() -> Self {
+        Self {
+            stream_mode: DownloadStreamMode::CaptureSilent,
+            refuse_media_to_stdout: true,
+        }
+    }
+}
+
 /// Downloader backend contract (invokes `yt-dlp` and verifies output artifacts in v1).
 pub trait Downloader: Send + Sync {
     /// Executes the download described by `request` and reports confirmed output artifacts.
     fn download(&self, request: &DownloadRequest) -> Result<DownloadOutcome, DownloadError>;
+
+    /// Executes the download using the requested [`DownloadExecutionOptions`].
+    ///
+    /// Default implementation delegates to [`Downloader::download`] so existing test/stub
+    /// implementors continue to work unchanged.
+    fn download_with_options(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+    ) -> Result<DownloadOutcome, DownloadError> {
+        let _ = options;
+        self.download(request)
+    }
+
+    /// Optional working directory hint used by pre-spawn effective option checks.
+    fn working_dir_hint(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// Placeholder [`Downloader`] implementation used until the `yt-dlp` backend is wired.
@@ -443,8 +512,19 @@ impl YtDlpDownloader {
 
 impl Downloader for YtDlpDownloader {
     fn download(&self, request: &DownloadRequest) -> Result<DownloadOutcome, DownloadError> {
+        self.download_with_options(request, DownloadExecutionOptions::passthrough())
+    }
+
+    fn download_with_options(
+        &self,
+        request: &DownloadRequest,
+        options: DownloadExecutionOptions,
+    ) -> Result<DownloadOutcome, DownloadError> {
         request.validate()?;
         let effective_working_dir = self.resolve_effective_working_dir()?;
+        if options.refuse_media_to_stdout {
+            ensure_no_media_to_stdout(request, &effective_working_dir)?;
+        }
         let forwarded = request.forward_args();
         let mode = InvocationMode::from_args(&forwarded);
         let attach_manifest = !has_info_only_exit_flag(&forwarded);
@@ -467,13 +547,32 @@ impl Downloader for YtDlpDownloader {
         if let Some(dir) = &self.working_dir {
             command.current_dir(dir);
         }
-        command.stdin(Stdio::inherit());
-        if request.target.is_pending_upload() {
-            command.stdout(Stdio::piped());
-        } else {
-            command.stdout(Stdio::inherit());
+        match options.stream_mode {
+            DownloadStreamMode::Passthrough => {
+                command.stdin(Stdio::inherit());
+                if request.target.is_pending_upload() {
+                    command.stdout(Stdio::piped());
+                } else {
+                    command.stdout(Stdio::inherit());
+                }
+            }
+            DownloadStreamMode::RedirectStdoutToStderr => {
+                command.stdin(Stdio::inherit());
+                command.stdout(Stdio::piped());
+            }
+            DownloadStreamMode::CaptureSilent => {
+                command.stdin(Stdio::null());
+                command.stdout(Stdio::piped());
+            }
         }
         command.stderr(Stdio::piped());
+
+        let stdout_target = match options.stream_mode {
+            DownloadStreamMode::Passthrough => StdoutForwardTarget::Stdout,
+            DownloadStreamMode::RedirectStdoutToStderr => StdoutForwardTarget::Stderr,
+            DownloadStreamMode::CaptureSilent => StdoutForwardTarget::None,
+        };
+        let forward_stderr = !matches!(options.stream_mode, DownloadStreamMode::CaptureSilent);
 
         let mut child = command.spawn().map_err(|err| {
             if is_binary_unavailable_error(&err) {
@@ -491,10 +590,12 @@ impl Downloader for YtDlpDownloader {
 
         let (status, stdout_attribution_paths, stdout_fallback_err, stderr_captured) =
             thread::scope(|scope| {
-                let stdout_handle = child_stdout
-                    .map(|reader| scope.spawn(move || stream_stdout_with_attribution(reader)));
-                let stderr_handle = child_stderr
-                    .map(|reader| scope.spawn(move || stream_and_capture_stderr(reader)));
+                let stdout_handle = child_stdout.map(|reader| {
+                    scope.spawn(move || stream_stdout_with_attribution(reader, stdout_target))
+                });
+                let stderr_handle = child_stderr.map(|reader| {
+                    scope.spawn(move || stream_and_capture_stderr(reader, forward_stderr))
+                });
 
                 let status_res = child.wait();
                 let (attr_paths, last_stdout_err) = match stdout_handle {
@@ -556,6 +657,10 @@ impl Downloader for YtDlpDownloader {
             confirmed_artifacts,
         })
     }
+
+    fn working_dir_hint(&self) -> Option<&Path> {
+        self.working_dir.as_deref()
+    }
 }
 
 /// Complete report returned by [`execute_download`].
@@ -578,6 +683,22 @@ pub fn execute_download(
     storage: &dyn Storage,
     downloader: &dyn Downloader,
     input: DownloadPlanInput,
+) -> Result<DownloadExecutionReport, AppError> {
+    execute_download_with_options(
+        storage,
+        downloader,
+        input,
+        DownloadExecutionOptions::passthrough(),
+    )
+}
+
+/// Resolves preset/target inputs, executes the download with explicit stream options, and updates
+/// pending upload status.
+pub fn execute_download_with_options(
+    storage: &dyn Storage,
+    downloader: &dyn Downloader,
+    input: DownloadPlanInput,
+    options: DownloadExecutionOptions,
 ) -> Result<DownloadExecutionReport, AppError> {
     let target = match input.target {
         DownloadTargetInput::Url(url) => DownloadTarget::DirectUrl { url },
@@ -614,7 +735,18 @@ pub fn execute_download(
         cookies: input.cookies,
     };
 
-    let outcome = downloader.download(&request)?;
+    request.validate()?;
+    if options.refuse_media_to_stdout {
+        let working_dir = match downloader.working_dir_hint() {
+            Some(dir) => dir.to_path_buf(),
+            None => env::current_dir().map_err(|err| {
+                DownloadError::Io(format!("failed to determine working dir: {err}"))
+            })?,
+        };
+        ensure_no_media_to_stdout(&request, &working_dir)?;
+    }
+
+    let outcome = downloader.download_with_options(&request, options)?;
     let marked_downloaded = match &request.target {
         DownloadTarget::PendingUpload { upload } if outcome.should_mark_downloaded() => {
             storage.mark_upload_downloaded(upload.id)?;
@@ -1122,7 +1254,17 @@ fn has_info_only_exit_flag(args: &[String]) -> bool {
     false
 }
 
-fn stream_stdout_with_attribution<R: Read>(mut reader: R) -> (Vec<PathBuf>, String) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdoutForwardTarget {
+    Stdout,
+    Stderr,
+    None,
+}
+
+fn stream_stdout_with_attribution<R: Read>(
+    mut reader: R,
+    forward_target: StdoutForwardTarget,
+) -> (Vec<PathBuf>, String) {
     const MAX_ATTR_PATHS: usize = 1024;
     const MAX_LINE_BYTES: usize = 8192;
 
@@ -1136,9 +1278,19 @@ fn stream_stdout_with_attribution<R: Read>(mut reader: R) -> (Vec<PathBuf>, Stri
             Ok(0) => break,
             Ok(n) => {
                 let chunk = &buf[..n];
-                let mut stdout = io::stdout().lock();
-                let _ = stdout.write_all(chunk);
-                let _ = stdout.flush();
+                match forward_target {
+                    StdoutForwardTarget::Stdout => {
+                        let mut stdout = io::stdout().lock();
+                        let _ = stdout.write_all(chunk);
+                        let _ = stdout.flush();
+                    }
+                    StdoutForwardTarget::Stderr => {
+                        let mut stderr = io::stderr().lock();
+                        let _ = stderr.write_all(chunk);
+                        let _ = stderr.flush();
+                    }
+                    StdoutForwardTarget::None => {}
+                }
 
                 for &byte in chunk {
                     if byte == b'\n' || byte == b'\r' {
@@ -1189,7 +1341,7 @@ fn process_streamed_stdout_line(
     pending_line.clear();
 }
 
-fn stream_and_capture_stderr<R: Read>(mut reader: R) -> String {
+fn stream_and_capture_stderr<R: Read>(mut reader: R, forward_to_stderr: bool) -> String {
     const MAX_CAPTURE_BYTES: usize = 64 * 1024;
     let mut captured = Vec::new();
     let mut buf = [0u8; 4096];
@@ -1198,9 +1350,11 @@ fn stream_and_capture_stderr<R: Read>(mut reader: R) -> String {
             Ok(0) => break,
             Ok(n) => {
                 let chunk = &buf[..n];
-                let mut stderr = io::stderr().lock();
-                let _ = stderr.write_all(chunk);
-                let _ = stderr.flush();
+                if forward_to_stderr {
+                    let mut stderr = io::stderr().lock();
+                    let _ = stderr.write_all(chunk);
+                    let _ = stderr.flush();
+                }
                 if captured.len() < MAX_CAPTURE_BYTES {
                     let remaining = MAX_CAPTURE_BYTES - captured.len();
                     captured.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
@@ -1210,6 +1364,354 @@ fn stream_and_capture_stderr<R: Read>(mut reader: R) -> String {
         }
     }
     String::from_utf8_lossy(&captured).into_owned()
+}
+
+/// Rejects invocations whose effective `yt-dlp` output template would stream media to stdout (`-o -`),
+/// taking active presets, extra arguments, aliases, and ambient/explicit `yt-dlp` config files into account.
+pub fn ensure_no_media_to_stdout(
+    request: &DownloadRequest,
+    working_dir: &Path,
+) -> Result<(), DownloadError> {
+    ensure_no_media_to_stdout_with_env(request, working_dir, &|key| env::var_os(key))
+}
+
+fn ensure_no_media_to_stdout_with_env(
+    request: &DownloadRequest,
+    working_dir: &Path,
+    get_env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<(), DownloadError> {
+    let mut state = EffectiveOutputScan::default();
+    let preset_label = request
+        .preset_name
+        .as_ref()
+        .map_or_else(|| "preset".to_owned(), |name| format!("preset '{name}'"));
+
+    if request.target.is_pending_upload() {
+        state.scan_tokens(&request.preset_args, &preset_label, false);
+        state.scan_tokens(&request.extra_args, "command-line arguments", false);
+    } else {
+        // First inspect CLI/preset args for `--ignore-config`, `--no-config`, `--alias`, and `--config-locations`.
+        let mut discovery = EffectiveOutputScan::default();
+        discovery.scan_tokens(&request.preset_args, &preset_label, true);
+        discovery.scan_tokens(&request.extra_args, "command-line arguments", true);
+
+        let mut visited = BTreeSet::new();
+        if !discovery.ignore_config {
+            for conf_path in default_yt_dlp_config_candidates(working_dir, get_env) {
+                if state.ignore_config {
+                    break;
+                }
+                load_config_file_recursive(&conf_path, working_dir, &mut visited, &mut state, 0);
+            }
+        }
+        for explicit_conf in discovery.config_locations {
+            let resolved = resolve_config_location_path(&explicit_conf, working_dir);
+            load_config_file_recursive(&resolved, working_dir, &mut visited, &mut state, 0);
+        }
+
+        state.scan_tokens(&request.preset_args, &preset_label, false);
+        state.scan_tokens(&request.extra_args, "command-line arguments", false);
+    }
+
+    if let Some((template, source_detail)) = state.effective_default_output
+        && is_stdout_output_template(&template)
+    {
+        return Err(DownloadError::MediaToStdoutDisallowed { source_detail });
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct EffectiveOutputScan {
+    aliases: BTreeMap<String, Vec<String>>,
+    ignore_config: bool,
+    config_locations: Vec<PathBuf>,
+    effective_default_output: Option<(String, String)>,
+}
+
+impl EffectiveOutputScan {
+    fn scan_tokens(&mut self, tokens: &[String], source_label: &str, discovery_only: bool) {
+        const MAX_ALIAS_EXPANSIONS: usize = 64;
+        let mut queue: Vec<String> = tokens.to_vec();
+        let mut i = 0usize;
+        let mut expansions = 0usize;
+
+        while i < queue.len() {
+            let arg = queue[i].clone();
+            if arg == "--" {
+                break;
+            }
+            if !arg.starts_with('-') || arg == "-" {
+                i += 1;
+                continue;
+            }
+            if let Some(expansion) = self.aliases.get(&arg).cloned()
+                && expansions < MAX_ALIAS_EXPANSIONS
+            {
+                expansions += 1;
+                queue.splice(i..=i, expansion);
+                continue;
+            }
+
+            if let Some(rest) = arg.strip_prefix("--") {
+                let (raw_name, inline_val) = match rest.split_once('=') {
+                    Some((name, val)) => (name, Some(val.to_owned())),
+                    None => (rest, None),
+                };
+                let canonical = resolve_passthrough_long_flag(raw_name);
+                match canonical {
+                    "ignore-config" | "no-config" => {
+                        self.ignore_config = true;
+                    }
+                    "config-locations" => {
+                        let val = inline_val
+                            .as_deref()
+                            .map(str::to_owned)
+                            .or_else(|| queue.get(i + 1).cloned());
+                        if let Some(path) = val {
+                            self.config_locations.push(PathBuf::from(path));
+                        }
+                    }
+                    "alias" => {
+                        if let (Some(flag), Some(body)) = (queue.get(i + 1), queue.get(i + 2)) {
+                            self.aliases
+                                .insert(flag.clone(), tokenize_config_line(body));
+                        }
+                    }
+                    "output" if !discovery_only => {
+                        let val = inline_val
+                            .as_deref()
+                            .map(str::to_owned)
+                            .or_else(|| queue.get(i + 1).cloned());
+                        if let Some(template) = val {
+                            self.record_output_template(template, source_label);
+                        }
+                    }
+                    _ => {}
+                }
+                if inline_val.is_none() {
+                    i += 1 + known_arity_for_passthrough_scan(canonical);
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+
+            let shorts = &arg[1..];
+            let mut extra_consumed = 0usize;
+            for (idx, ch) in shorts.char_indices() {
+                if ch == 'o' {
+                    let inline = &shorts[idx + ch.len_utf8()..];
+                    let val = if inline.is_empty() {
+                        extra_consumed = 1;
+                        queue.get(i + 1).cloned()
+                    } else {
+                        Some(inline.to_owned())
+                    };
+                    if !discovery_only && let Some(template) = val {
+                        self.record_output_template(template, source_label);
+                    }
+                    break;
+                }
+                if allowed_short_option_arity(ch) == Some(1) || ch == 'a' {
+                    let has_inline = idx + ch.len_utf8() < shorts.len();
+                    if !has_inline {
+                        extra_consumed = 1;
+                    }
+                    break;
+                }
+            }
+            i += 1 + extra_consumed;
+        }
+    }
+
+    fn record_output_template(&mut self, template: String, source_label: &str) {
+        let (kind, _) = split_yt_dlp_type_prefix(template.trim());
+        if kind.is_none() || matches!(kind.as_deref(), Some("default" | "pl_video" | "chapter")) {
+            self.effective_default_output = Some((template, source_label.to_owned()));
+        }
+    }
+}
+
+fn resolve_passthrough_long_flag(raw_name: &str) -> &str {
+    match raw_name {
+        "ignore-config" | "no-config" | "config-locations" | "config-location" | "alias"
+        | "output" => raw_name,
+        "config" => "config-locations",
+        other if "config-locations".starts_with(other) && other.len() >= "config".len() => {
+            "config-locations"
+        }
+        other if "ignore-config".starts_with(other) && other.len() >= "ignore-con".len() => {
+            "ignore-config"
+        }
+        other => other,
+    }
+}
+
+fn is_stdout_output_template(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed == "-" {
+        return true;
+    }
+    let (kind, rest) = split_yt_dlp_type_prefix(trimmed);
+    matches!(kind.as_deref(), Some("default" | "pl_video" | "chapter")) && rest.trim() == "-"
+}
+
+fn default_yt_dlp_config_candidates(
+    working_dir: &Path,
+    get_env: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(not(windows))]
+    {
+        paths.push(PathBuf::from("/etc/yt-dlp.conf"));
+        paths.push(PathBuf::from("/etc/yt-dlp/config"));
+    }
+
+    let non_empty_path = |key: &str| get_env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = non_empty_path("APPDATA") {
+            paths.push(appdata.join("yt-dlp").join("config"));
+            paths.push(appdata.join("yt-dlp").join("config.txt"));
+        }
+        if let Some(home) = non_empty_path("USERPROFILE").or_else(|| non_empty_path("HOME")) {
+            paths.push(home.join("yt-dlp.conf"));
+            paths.push(home.join("yt-dlp.conf.txt"));
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let home = non_empty_path("HOME");
+        if let Some(xdg) =
+            non_empty_path("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config")))
+        {
+            paths.push(xdg.join("yt-dlp").join("config"));
+            paths.push(xdg.join("yt-dlp").join("config.txt"));
+        }
+        if let Some(home) = home {
+            paths.push(home.join(".config").join("yt-dlp.conf"));
+            paths.push(home.join("yt-dlp.conf"));
+            paths.push(home.join("yt-dlp.conf.txt"));
+        }
+    }
+
+    paths.push(working_dir.join("yt-dlp.conf"));
+    paths
+}
+
+fn resolve_config_location_path(raw: &Path, working_dir: &Path) -> PathBuf {
+    let resolved = if raw.is_relative() {
+        working_dir.join(raw)
+    } else {
+        raw.to_path_buf()
+    };
+    if resolved.is_dir() {
+        let primary = resolved.join("yt-dlp.conf");
+        if primary.is_file() {
+            return primary;
+        }
+        let alt = resolved.join("yt-dlp.conf.txt");
+        if alt.is_file() {
+            return alt;
+        }
+    }
+    resolved
+}
+
+fn load_config_file_recursive(
+    path: &Path,
+    working_dir: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    state: &mut EffectiveOutputScan,
+    depth: usize,
+) {
+    const MAX_CONFIG_DEPTH: usize = 8;
+    if depth >= MAX_CONFIG_DEPTH || !path.is_file() {
+        return;
+    }
+    let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(key) {
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    let mut tokens = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        tokens.extend(tokenize_config_line(trimmed));
+    }
+
+    let prev_len = state.config_locations.len();
+    let label = format!("yt-dlp config '{}'", path.display());
+    state.scan_tokens(&tokens, &label, false);
+    let newly_added: Vec<PathBuf> = state.config_locations[prev_len..].to_vec();
+    for nested in newly_added {
+        let resolved = resolve_config_location_path(&nested, working_dir);
+        load_config_file_recursive(&resolved, working_dir, visited, state, depth + 1);
+    }
+}
+
+fn tokenize_config_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else if ch == '\\' && q == '"' {
+                    if let Some(&next) = chars.peek()
+                        && (next == '"' || next == '\\')
+                    {
+                        current.push(chars.next().unwrap());
+                    } else {
+                        current.push(ch);
+                    }
+                } else {
+                    current.push(ch);
+                }
+                in_token = true;
+            }
+            None => {
+                if ch == '#' && !in_token {
+                    break;
+                }
+                if ch.is_whitespace() {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                } else if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    in_token = true;
+                } else if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                        in_token = true;
+                    }
+                } else {
+                    current.push(ch);
+                    in_token = true;
+                }
+            }
+        }
+    }
+
+    if in_token {
+        tokens.push(current);
+    }
+    tokens
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2406,6 +2908,109 @@ mod tests {
             },
             &upload,
             &[],
+        ));
+    }
+
+    fn direct_request(preset_args: Vec<&str>, extra_args: Vec<&str>) -> DownloadRequest {
+        DownloadRequest {
+            target: DownloadTarget::DirectUrl {
+                url: "https://www.bilibili.com/video/BV1stdout".to_owned(),
+            },
+            preset_name: (!preset_args.is_empty()).then(|| PresetName::new("custom").unwrap()),
+            preset_args: preset_args.into_iter().map(str::to_owned).collect(),
+            extra_args: extra_args.into_iter().map(str::to_owned).collect(),
+            cookies: None,
+        }
+    }
+
+    #[test]
+    fn media_to_stdout_check_respects_cli_presets_overrides_and_configs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let work_dir = temp.path().join("work");
+        let home_dir = temp.path().join("home");
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+        let env_lookup = |key: &str| -> Option<OsString> {
+            match key {
+                "HOME" => Some(home_dir.as_os_str().to_os_string()),
+                _ => None,
+            }
+        };
+
+        // Direct CLI/preset variants that stream media to stdout are rejected.
+        for extra in [
+            vec!["-o", "-"],
+            vec!["-o-"],
+            vec!["--output", "-"],
+            vec!["--output=-"],
+            vec!["-qo", "-"],
+            vec!["-qo-"],
+            vec!["-o", "default:-"],
+            vec!["--output=pl_video:-"],
+            vec!["-o", "chapter:-"],
+            vec!["-o", "-", "-o", "thumbnail:thumb.jpg"],
+        ] {
+            let req = direct_request(vec![], extra.clone());
+            assert!(
+                matches!(
+                    ensure_no_media_to_stdout_with_env(&req, &work_dir, &env_lookup),
+                    Err(DownloadError::MediaToStdoutDisallowed { .. })
+                ),
+                "expected refusal for {extra:?}"
+            );
+        }
+
+        // Preset `-o -` is refused, unless overridden on CLI or bypassed (`preset_args` empty).
+        let preset_stdout = direct_request(vec!["-o", "-"], vec![]);
+        assert!(matches!(
+            ensure_no_media_to_stdout_with_env(&preset_stdout, &work_dir, &env_lookup),
+            Err(DownloadError::MediaToStdoutDisallowed { .. })
+        ));
+        let preset_overridden = direct_request(vec!["-o", "-"], vec!["-o", "out.mp4"]);
+        assert!(
+            ensure_no_media_to_stdout_with_env(&preset_overridden, &work_dir, &env_lookup).is_ok()
+        );
+        let no_preset = direct_request(vec![], vec!["-J"]);
+        assert!(ensure_no_media_to_stdout_with_env(&no_preset, &work_dir, &env_lookup).is_ok());
+
+        // `--` separator treats `-o -` as positional, and text stdout (`-J`, `--print`) is allowed.
+        let after_sep = direct_request(vec![], vec!["--", "-o", "-"]);
+        assert!(ensure_no_media_to_stdout_with_env(&after_sep, &work_dir, &env_lookup).is_ok());
+        let print_only = direct_request(vec![], vec!["--print", "title"]);
+        assert!(ensure_no_media_to_stdout_with_env(&print_only, &work_dir, &env_lookup).is_ok());
+
+        // Ambient `yt-dlp.conf` with `-o -` is detected and refused unless ignored or overridden.
+        fs::write(work_dir.join("yt-dlp.conf"), "# comment\n-o \"-\"\n").unwrap();
+        let ambient = direct_request(vec![], vec![]);
+        assert!(matches!(
+            ensure_no_media_to_stdout_with_env(&ambient, &work_dir, &env_lookup),
+            Err(DownloadError::MediaToStdoutDisallowed { .. })
+        ));
+        let ignored = direct_request(vec![], vec!["--ignore-config"]);
+        assert!(ensure_no_media_to_stdout_with_env(&ignored, &work_dir, &env_lookup).is_ok());
+        let no_conf = direct_request(vec![], vec!["--no-config"]);
+        assert!(ensure_no_media_to_stdout_with_env(&no_conf, &work_dir, &env_lookup).is_ok());
+        let overridden = direct_request(vec![], vec!["-o", "safe.mp4"]);
+        assert!(ensure_no_media_to_stdout_with_env(&overridden, &work_dir, &env_lookup).is_ok());
+        // Tracked uploads always pass `--ignore-config`, so ambient `yt-dlp.conf` does not apply.
+        let pending = pending_request(vec![], vec![]);
+        assert!(ensure_no_media_to_stdout_with_env(&pending, &work_dir, &env_lookup).is_ok());
+
+        // Explicit `--config-locations` (even with `--ignore-config`) and `--alias` expansions are checked.
+        fs::remove_file(work_dir.join("yt-dlp.conf")).unwrap();
+        let custom_conf = temp.path().join("pipe.conf");
+        fs::write(&custom_conf, "--alias --pipe \"-o -\"\n--pipe\n").unwrap();
+        let explicit_conf = direct_request(
+            vec![],
+            vec![
+                "--ignore-config",
+                "--config-locations",
+                custom_conf.to_str().unwrap(),
+            ],
+        );
+        assert!(matches!(
+            ensure_no_media_to_stdout_with_env(&explicit_conf, &work_dir, &env_lookup),
+            Err(DownloadError::MediaToStdoutDisallowed { .. })
         ));
     }
 }

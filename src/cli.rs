@@ -1,8 +1,9 @@
 //! Command-line argument definitions (`clap`) matching the Siphon CLI specification.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::domain::{CookieSource, CreatorId, NonEmptyString, PresetName, UploadId};
 use crate::download::{DownloadPlanInput, DownloadTargetInput, PresetSelection};
@@ -30,9 +31,92 @@ pub struct Cli {
     )]
     pub db: Option<PathBuf>,
 
+    /// Emit a single structured JSON response on stdout and redirect downloader text output to stderr.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Primary Siphon subcommand.
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Returns `true` if `--json` was supplied as a Siphon option before the first `--` separator.
+#[must_use]
+pub fn has_json_flag<I, T>(args: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    let mut skip_next_value = false;
+    for arg in args.into_iter().skip(1) {
+        let Some(text) = arg.as_ref().to_str() else {
+            skip_next_value = false;
+            continue;
+        };
+        if skip_next_value {
+            skip_next_value = false;
+            continue;
+        }
+        if text == "--" {
+            break;
+        }
+        if text == "--json" {
+            return true;
+        }
+        if is_value_taking_siphon_flag(text) {
+            skip_next_value = true;
+        }
+    }
+    false
+}
+
+/// Resolves the command path and [`clap::Command`] targeted by a help request.
+#[must_use]
+pub fn resolve_help_command<I, T>(args: I) -> (Vec<String>, clap::Command)
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    let mut current = Cli::command();
+    current.build();
+    let mut path = vec![current.get_name().to_owned()];
+    let mut skip_next_value = false;
+
+    for arg in args.into_iter().skip(1) {
+        let Some(text) = arg.as_ref().to_str() else {
+            skip_next_value = false;
+            continue;
+        };
+        if skip_next_value {
+            skip_next_value = false;
+            continue;
+        }
+        if text == "--" {
+            break;
+        }
+        if text.starts_with('-') {
+            if is_value_taking_siphon_flag(text) {
+                skip_next_value = true;
+            }
+            continue;
+        }
+        if text == "help" {
+            continue;
+        }
+        if let Some(sub) = current.find_subcommand(text).cloned() {
+            path.push(sub.get_name().to_owned());
+            current = sub;
+        }
+    }
+
+    (path, current)
+}
+
+fn is_value_taking_siphon_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--db" | "--preset" | "--upload" | "--cookies" | "--cookies-from-browser"
+    )
 }
 
 /// Top-level Siphon subcommands.
@@ -329,4 +413,88 @@ fn parse_non_empty_path(raw: &str) -> Result<PathBuf, ValidationError> {
         return Err(ValidationError::EmptyValue { field: "path" });
     }
     Ok(PathBuf::from(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_json_flag_only_when_supplied_as_siphon_option() {
+        assert!(has_json_flag(["siphon", "--json"]));
+        assert!(has_json_flag(["siphon", "--json", "--help"]));
+        assert!(has_json_flag(["siphon", "--help", "--json"]));
+        assert!(has_json_flag(["siphon", "creator", "list", "--json"]));
+        assert!(has_json_flag([
+            "siphon",
+            "--db",
+            "/tmp/siphon.db",
+            "--json",
+            "download",
+            "https://example.com",
+            "--",
+            "-J",
+        ]));
+        assert!(has_json_flag([
+            "siphon",
+            "download",
+            "https://example.com",
+            "--json",
+            "--",
+            "-o",
+            "-",
+        ]));
+
+        // `--json` after `--` belongs to yt-dlp / preset args, not Siphon.
+        assert!(!has_json_flag([
+            "siphon",
+            "download",
+            "https://example.com",
+            "--",
+            "--json",
+        ]));
+        assert!(!has_json_flag([
+            "siphon", "preset", "add", "custom", "--", "--json",
+        ]));
+        // `--json` consumed as a value to a Siphon flag is not the `--json` mode flag.
+        assert!(!has_json_flag([
+            "siphon", "--db", "--json", "creator", "list"
+        ]));
+        assert!(!has_json_flag([
+            "siphon",
+            "download",
+            "https://example.com",
+            "--cookies",
+            "--json",
+        ]));
+    }
+
+    #[test]
+    fn resolves_help_command_paths_across_subcommands() {
+        let (root_path, root_cmd) = resolve_help_command(["siphon", "--json", "--help"]);
+        assert_eq!(root_path, vec!["siphon"]);
+        assert_eq!(root_cmd.get_name(), "siphon");
+
+        let (creator_path, creator_cmd) =
+            resolve_help_command(["siphon", "creator", "--json", "--help"]);
+        assert_eq!(creator_path, vec!["siphon", "creator"]);
+        assert_eq!(creator_cmd.get_name(), "creator");
+
+        let (add_path, add_cmd) = resolve_help_command([
+            "siphon",
+            "--db",
+            "/tmp/a.db",
+            "--json",
+            "creator",
+            "add",
+            "--help",
+        ]);
+        assert_eq!(add_path, vec!["siphon", "creator", "add"]);
+        assert_eq!(add_cmd.get_name(), "add");
+
+        let (help_sub_path, help_sub_cmd) =
+            resolve_help_command(["siphon", "--json", "help", "preset", "add"]);
+        assert_eq!(help_sub_path, vec!["siphon", "preset", "add"]);
+        assert_eq!(help_sub_cmd.get_name(), "add");
+    }
 }
